@@ -1,0 +1,613 @@
+---
+title: "count_matrix"
+output: html_document
+date: "2025-07-22"
+---
+
+
+Merge samples
+```{python}
+
+import pysam
+import os
+
+def add_suffix_to_tags(input_bam, output_bam, suffix):
+   # Open the input BAM file in read mode
+   with pysam.AlignmentFile(input_bam, "rb", check_sq=False) as infile:
+       # Open the output BAM file in write mode with the same header as the input
+       with pysam.AlignmentFile(output_bam, "wb", header=infile.header) as outfile:
+           for read in infile:
+               # Modify the CB tag
+               if read.has_tag("CB"):
+                   original_cb = read.get_tag("CB")
+                   modified_cb = f"{original_cb}-{suffix}"
+                   read.set_tag("CB", modified_cb, value_type='Z')
+               # Modify the XM tag
+               if read.has_tag("XM"):
+                   original_xm = read.get_tag("XM")
+                   modified_xm = f"{original_xm}-{suffix}"
+                   read.set_tag("XM", modified_xm, value_type='Z')
+               # Modify the molecule identifier in the query name (QNAME)
+               if "molecule/" in read.query_name:
+                   original_molecule = read.query_name.split("/")[1]
+                   modified_molecule = f"molecule/{original_molecule}-{suffix}"
+                   read.query_name = modified_molecule
+               # Write the modified read to the output file
+               outfile.write(read)
+
+# Directory and sample list
+directory = "/hpc/hers_en/shared/chiem/data_analysis/exome_enriched/pbmm2_alignment/" # or no_enrichment
+samples = ["bcM0001", "bcM0002", "bcM0004"]
+
+# Loop through samples and process each BAM file
+for sample in samples:
+   input_bam = os.path.join(directory, f"{sample}.pbmm2.aligned.bam")
+   output_bam = os.path.join(directory, f"{sample}.pbmm2.aligned.anno.bam")
+   suffix = sample + '-enr' # or no_enr
+   add_suffix_to_tags(input_bam, output_bam, suffix)
+    
+```
+
+
+# run script
+```{bash, eval=FALSE}
+
+# run it
+echo -e "\
+#!/bin/bash  
+python data_analysis/no_enrichment/pbmm2_alignment/add_suffix_to_tags.py" | sbatch --time 1:00:00 --mem 16G 
+
+# index
+cd $outDir/pbmm2_alignment
+
+for sample in ${samples[@]} 
+  do
+    samtools index ${sample}.pbmm2.aligned.anno.bam
+  done
+
+# merge
+samtools merge -o merged.pbmm2.aligned.bam *.pbmm2.aligned.anno.bam
+samtools index merged.pbmm2.aligned.bam
+
+# clean up
+for sample in ${samples[@]} 
+  do
+    rm ${sample}.pbmm2.aligned.bam
+    rm ${sample}.pbmm2.aligned.bam.bai
+  done
+
+```
+
+
+Collapse redundant transcripts based on exonic structures using isoseq collapse
+```{bash, eval=FALSE}
+
+echo -e "\
+#!/bin/bash  
+isoseq collapse --log-level INFO --log-file ${outDir}/isoseq_collapse_redundancyRemoval/merged.isoseq.collapse.log ${outDir}/pbmm2_alignment/merged.pbmm2.aligned.bam ${outDir}/isoseq_collapse_redundancyRemoval/merged.isoseq.collapse.gff" | sbatch --time 30:00:00 --mem 15G --gres=tmpspace:10G --job-name isoseq.collapse.merged -o $outDir/logfiles/isoseq.collapse.merged.log -e $outDir/logfiles/isoseq.collapse.merged.log 
+
+```
+
+
+SQANTI QC
+
+## Make SQANTI3-format isoform count file
+
+srun  --time 1:00:00 --mem 120G --pty bash
+```{bash, eval=FALSE}
+
+# get total number of reads
+Nreads=$(awk '{if (NR > 4) sum += $2} END {print sum}' ${outDir}/isoseq_collapse_redundancyRemoval/merged.isoseq.collapse.abundance.txt)
+echo $Nreads
+
+# Needs to have an id, a count_fl and a norm_fl (count_fl / total number of FL reads, mapped or unmapped)
+nano ${outDir}/SQANTI3/merged.isoseq.collapse.flnc_count.SQANTIformat.tsv  
+
+# note we take the second column (deduplicated) not the third (duplicated)
+echo -e "pbid\tcount_fl\tnorm_fl" >> ${outDir}/SQANTI3/merged.isoseq.collapse.flnc_count.SQANTIformat.tsv  
+flncCount=${outDir}/isoseq_collapse_redundancyRemoval/merged.isoseq.collapse.abundance.txt
+cat $flncCount | tail -n+5 | awk -v  Nreads=$Nreads '{print $1, $2, $2/Nreads}' | tr " " "\t" >> ${outDir}/SQANTI3/merged.isoseq.collapse.flnc_count.SQANTIformat.tsv  
+
+```
+
+
+## Run SQANTI3 Quality Control
+```{bash, eval=FALSE}
+
+#!/bin/bash
+wrk=/hpc/hers_en/shared/chiem
+outDir=${wrk}/data_analysis/exome_enriched
+req=/hpc/hers_en/cvandijk/longRead_singleNucleus/pipeline/requiredFiles/
+transcriptGTF=${outDir}/isoseq_collapse_redundancyRemoval/merged.isoseq.collapse.gff
+refFASTA=$req/human_GRCh38_no_alt_analysis_set.fasta
+refGTF=$req/tmp/gencode.v46.annotation.sorted.gtf
+outPrefix=SQANTI_QC
+out=${outDir}/SQANTI3/
+flncCount_adj=${outDir}/SQANTI3/merged.isoseq.collapse.flnc_count.SQANTIformat.tsv
+
+cd $wrk/SQANTI3-5.3.5
+
+python sqanti3_qc.py --skipORF $transcriptGTF $refGTF $refFASTA -o $outPrefix -d $out \
+                     -fl $flncCount_adj \
+                     --cpus 4 --report both \
+
+echo "Got to the end"
+
+```
+
+## run it
+```{bash}
+conda activate sqanti3
+
+# need ram for pdf creation at the very end, can use much less if needed
+echo -e "\
+#!/bin/bash
+${outDir}/SQANTI3/SQANTI_QC.sh" | sbatch --time 24:00:00 --mem 256G --gres=tmpspace:10G --job-name SQANTIQC -o ${outDir}/SQANTI3/SQANTI_QC_log -e ${outDir}/SQANTI3/SQANTI_QC_log
+
+```
+
+
+# get plots and stats
+```{r}
+library(ggplot2)
+library(dplyr)
+library(rtracklayer)
+library(stringr)
+
+# load files (these are SQANTI3 classification files from isoseq collapsed reads)
+enr_reads <- read.delim('~/School/longshort/ExoLR_classification.txt', header = TRUE, sep = "\t")
+no_enr_reads <- read.delim('~/School/longshort/LR_classification.txt', header = TRUE, sep = "\t")
+gene_info  <- readRDS('~/School/longshort/gene_info.rds')  # this is created during differential expression 
+
+# For no_enr_reads
+no_enr_df <- no_enr_reads %>%
+  dplyr::rename(gene_id = associated_gene) %>%  
+  left_join(gene_info, by = "gene_id") %>%
+  filter(!is.na(width)) %>% # Ensure only genes with width are kept (width = total exon length)
+  mutate(length_ratio = length / width) # Calculate length_ratio for each entry
+
+
+# For enr_reads
+enr_df <- enr_reads %>%
+  dplyr::rename(gene_id = associated_gene) %>%  
+  left_join(gene_info, by = "gene_id") %>%
+  filter(!is.na(width)) %>% 
+  mutate(length_ratio = length / width) 
+
+# Weighted Density Plot
+ggplot() +
+  geom_density(data = enr_df, aes(x = length_ratio, weight = FL, fill = "ExoLR"), 
+               alpha = 0.6) +
+  geom_density(data = no_enr_df, aes(x = length_ratio, weight = FL, fill = "LR"), 
+               alpha = 0.6) +
+  scale_x_continuous(limits = c(0, 2)) +
+  scale_y_continuous(limits = c(0, 10)) +
+  scale_fill_manual(values = c("ExoLR" = "#ff7f0e", "LR" = "#1f77b4")) + 
+  labs(title = "", 
+       x = "Read Length / Total Exon Length", 
+       y = "Density", 
+       fill = "") +
+  theme_minimal()
+
+# Weighted Histogram Plot
+ggplot() +
+  geom_histogram(data = enr_df, aes(x = length_ratio, weight = FL, fill = "ExoLR"), 
+                 alpha = 0.9, binwidth = 0.01) +
+  geom_histogram(data = no_enr_df, aes(x = length_ratio, weight = FL, fill = "LR"), 
+                 alpha = 0.9, binwidth = 0.01) +
+  scale_x_continuous(limits = c(0, 2)) +
+  scale_y_continuous(limits = c(0, 3000000)) +
+  scale_fill_manual(values = c("ExoLR" = "#ff7f0e", "LR" = "#1f77b4")) +
+  labs(title = "", 
+       x = "Read Length / Total Exon Length", 
+       y = "Read Count", 
+       fill = "") +
+  theme_minimal()
+
+
+# Get counts per gene
+enr_df <- enr_reads %>%
+  filter(!str_starts(associated_gene, "novelGene")) %>%
+  group_by(associated_gene) %>%
+  summarise(total_FL = sum(FL, na.rm = TRUE))
+
+# Get counts per gene
+no_enr_df <- no_enr_reads %>%
+  filter(!str_starts(associated_gene, "novelGene")) %>%
+  group_by(associated_gene) %>%
+  summarise(total_FL = sum(FL, na.rm = TRUE))
+
+# Weighted Density Plot
+ggplot() +
+  geom_histogram(data = enr_df, aes(x = total_FL, fill = "ExoLR"), 
+               alpha = 0.6, binwidth = 1) +
+  geom_histogram(data = no_enr_df, aes(x = total_FL, fill = "LR"), 
+               alpha = 0.6, binwidth = 1) +
+  scale_x_continuous(limits = c(0, 2000)) +
+  scale_y_continuous(limits = c(0, 500)) +
+  scale_fill_manual(values = c("ExoLR" = "#ff7f0e", "LR" = "#1f77b4")) + 
+  labs(title = "", 
+       x = "Read Count / Gene", 
+       y = "Density", 
+       fill = "") +
+  theme_minimal()
+
+
+# Add a 'method' column to each dataframe
+enr_df$method <- "ExoLR"
+no_enr_df$method <- "LR"
+
+# Combine them into a single dataframe
+combined_df <- rbind(enr_df, no_enr_df)
+
+# Create a new column with the log2-transformed values
+combined_df$log2_total_FL <- log2(combined_df$total_FL)
+
+# Density Plot with log2 transformation
+ggplot(combined_df, aes(x = total_FL, fill = method)) +
+  # Use geom_density() for a smooth density curve
+  geom_density(alpha = 0.6) +
+  
+  # Apply a log2 transformation to the x-axis
+  scale_x_continuous(trans='log2', breaks=c(1, 4, 16, 64, 256, 1024, 4096, 16384)) +
+  
+  # Use the same color scale
+  scale_fill_manual(values = c("ExoLR" = "#ff7f0e", "LR" = "#1f77b4")) + 
+  
+  # Update labels to reflect the transformation
+  labs(title = "", 
+       x = "Read Count / Gene (log2 scale)", 
+       y = "Density", 
+       fill = "") +
+  theme_minimal()
+
+# Filter for genes with more than 10 reads, and get median
+median_counts <- combined_df %>%
+  filter(total_FL > 10) %>%
+  group_by(method) %>%
+  summarise(
+    median_read_count = median(total_FL)
+  )
+
+print(median_counts)
+
+# compare genes sequenced with both methods
+paired_df <- inner_join(enr_df, no_enr_df, 
+                        by = "associated_gene", 
+                        suffix = c(".enr", ".no_enr"))
+
+
+# Perform the Paired Wilcoxon test
+# We specify paired = TRUE and alternative = "greater"
+paired_test_result <- wilcox.test(paired_df$total_FL.enr, 
+                                  paired_df$total_FL.no_enr,
+                                  paired = TRUE,
+                                  alternative = "greater")
+
+# Print the result
+print(paired_test_result)
+
+```
+
+
+# add suffxix to dedup fasta files
+```{python, eval=FALSE}
+import os
+
+# Directory containing the fasta files
+input_dir = "/hpc/hers_en/shared/chiem/data_analysis/exome_enriched/isoseq_groupdedup_deduplication" # and no_enrichment
+
+# List of input fasta files and their respective prefixes
+fasta_files = [
+    ("bcM0001.dedup.fasta", "bcM0001"),
+    ("bcM0002.dedup.fasta", "bcM0002"),
+    ("bcM0004.dedup.fasta", "bcM0004"),
+]
+
+# Function to process each fasta file and save to a new output file
+def process_fasta(file_path, prefix):
+    output_file = os.path.join(input_dir, f"{prefix}_modified.fasta")
+    with open(file_path, 'r') as f_in, open(output_file, 'w') as f_out:
+        for line in f_in:
+            if line.startswith('>'):
+                # Split the line into parts for molecule name and tags
+                line_parts = line.strip().split(';')
+                # Modify the molecule name (first part before the ';') by adding the prefix
+                header = line_parts[0].split()[0] + f"-{prefix}"
+                
+                # Keep the rest of the line (XM, CB, etc.) the same
+                modified_line = header + ';' + ';'.join(line_parts[1:]) + '\n'
+                f_out.write(modified_line)
+            else:
+                # Write sequence lines without modification
+                f_out.write(line)
+
+    print(f"Processed file saved to: {output_file}")
+
+# Process each fasta file separately
+for fasta_file, prefix in fasta_files:
+    file_path = os.path.join(input_dir, fasta_file)
+    process_fasta(file_path, prefix)
+
+
+```
+
+## run it 
+```{bash, eval=FALSE}
+
+echo -e "\
+#!/bin/bash  
+python annotate_fasta.py" | sbatch --time 01:00:00 --mem 20G --job-name annotate_fasta -o /dev/null -e /dev/null
+
+```
+
+
+# edit classification to match pigeon 
+```{python}
+import sys
+import csv
+
+csv.field_size_limit(sys.maxsize)
+
+outDir = "/hpc/hers_en/shared/chiem/data_analysis/exome_enriched" # and no_enrichment
+
+# File paths
+abundance_file = f"{outDir}/isoseq_collapse_redundancyRemoval/merged.isoseq.collapse.abundance.txt"
+sqanti_file = f"{outDir}/SQANTI3/SQANTI_MLfilter/merged_SQANTI_MLfilter_MLresult_classification.txt"
+output_file = f"{outDir}/pigeon_make_seurat/merged_classification.txt"
+
+# Read abundance data into a dictionary
+abundance_data = {}
+with open(abundance_file, 'r') as af:
+
+    for _ in range(3):
+        next(af)
+    reader = csv.DictReader(af, delimiter='\t')
+    for row in reader:
+        pbid = row['pbid']
+        fl_assoc = row['fl_assoc']
+        cell_barcodes = row['cell_barcodes']
+        abundance_data[pbid] = {'fl_assoc': fl_assoc, 'cell_barcodes': cell_barcodes}
+
+# Update SQANTI3 classification file
+with open(sqanti_file, 'r') as sf, open(output_file, 'w', newline='') as of:
+    reader = csv.DictReader(sf, delimiter='\t')
+    fieldnames = reader.fieldnames + ['fl_assoc', 'cell_barcodes'] # Add new columns
+    writer = csv.DictWriter(of, fieldnames=fieldnames, delimiter='\t')
+
+    writer.writeheader()
+    for row in reader:
+        isoform = row['isoform']
+        if isoform in abundance_data:
+            # Add fl_assoc and cell_barcodes if pbid matches
+            row['fl_assoc'] = abundance_data[isoform]['fl_assoc']
+            row['cell_barcodes'] = abundance_data[isoform]['cell_barcodes']
+        else:
+            # Leave columns empty if no match
+            row['fl_assoc'] = ''
+            row['cell_barcodes'] = ''
+        writer.writerow(row)
+
+print(f"Updated file saved to: {output_file}")
+
+```
+
+
+# use pigeon_make_seurat
+```{bash}
+outDir=$wrk/data_analysis/exome_enriched # and no_enrichment
+samples=(bcM0001 bcM0002 bcM0004)
+
+# filter out artifacts 
+awk -F'\t' 'NR==1 || $7 !~ /^novelGene/' ${outDir}/pigeon_make_seurat/merged_classification.txt > ${outDir}/pigeon_make_seurat/merged_classification_filtered.txt
+
+# make seurat
+for sample in ${samples[@]}
+  do
+dedup=${outDir}/isoseq_groupdedup_deduplication/${sample}_modified.fasta
+group=${outDir}/isoseq_collapse_redundancyRemoval/merged.isoseq.collapse.group.txt 
+classification=${outDir}/pigeon_make_seurat/merged_classification_filtered.txt
+echo -e "\
+#!/bin/bash  
+pigeon make-seurat --log-level INFO --log-file ${outDir}/pigeon_make_seurat/${sample}_modified.log --dedup $dedup -g $group -o ${sample}_modified -d ${outDir}/pigeon_make_seurat/${sample}_modified $classification " | sbatch --time 05:00:00 --mem 32G --gres=tmpspace:15G --job-name pigeon_make_seurat -o /dev/null -e /dev/null
+  done
+  
+```
+
+
+# The barcodes attached to the long read data are not the ones that overlap with the short-read data but they are the reverse compliment. The reverse compliment barcode is given in the ...annotated.info.csv file in the sample folder, however, this contains a line per UMI, so first need to extract only necessary info
+```{bash}
+
+cd $wrk/data_analysis/exome_enriched/pigeon_make_seurat # and no_enrichment
+
+for sample in ${samples[@]}
+  do
+    cat ${sample}_modified/${sample}_modified.annotated.info.csv | cut -f 11,12  | head -n 1 > ${sample}_modified/${sample}_barcodesRev.txt
+    cat ${sample}_modified/${sample}_modified.annotated.info.csv | cut -f 11,12 | tail -n+2  | sort | uniq >> ${sample}_modified/${sample}_barcodesRev.txt
+  done
+  
+```
+
+
+# get files local 
+```{bash, eval=FALSE}
+
+enrichment=exome_enriched # and no_enrichment
+
+cd C:/Users/chiem/Documents/School/longshort
+mkdir R3_makeSeurat
+cd R3_makeSeurat
+samples=(bcM0001 bcM0002 bcM0004)
+mkdir no_enrichment
+mkdir exome_enriched
+
+for sample in ${samples[@]}
+do
+  /usr/bin/rsync -av -e "ssh -v -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" --progress \
+    gw2hpct04:/hpc/hers_en/shared/chiem/data_analysis/${enrichment}/pigeon_make_seurat/${sample}_modified/genes_seurat/ \
+    ${enrichment}/${sample}_modified
+done
+
+for sample in ${samples[@]}
+do
+  /usr/bin/rsync -av -e "ssh -v -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" --progress \
+    gw2hpct04:/hpc/hers_en/shared/chiem/data_analysis/${enrichment}/pigeon_make_seurat/${sample}_modified/${sample}_barcodesRev.txt \
+    ${enrichment}/${sample}_modified/${sample}_barcodesRev.txt
+done
+
+```
+
+
+# functions for seurat prep
+```{r}
+
+# Function to process and normalize data
+runSeurat <- function(seurat_object) {
+  seurat_object <- NormalizeData(seurat_object)
+  seurat_object <- FindVariableFeatures(seurat_object)
+  seurat_object <- ScaleData(seurat_object)
+  seurat_object <- RunPCA(seurat_object, verbose = FALSE)
+  seurat_object <- FindNeighbors(seurat_object, dims = 1:50)
+  seurat_object <- FindClusters(seurat_object, resolution = 0.2, verbose = FALSE)
+  seurat_object <- RunUMAP(seurat_object, dims = 1:50)
+  return(seurat_object)
+}
+
+# Function to map gene IDs
+map_gene_ids <- function(gene_ids) {
+  sapply(strsplit(gene_ids, "\\+"), function(ids) {
+    mapped <- gene_id_to_name[ids]
+    mapped[is.na(mapped)] <- ids[is.na(mapped)]
+    paste(mapped, collapse = "+")
+  })
+}
+
+# Function to process datasets
+process_sample_data <- function(sample, dir, short_read_name) {
+  data_dir <- file.path(dir, paste0(sample, "_modified"))
+  
+  # Load data
+  counts <- as(Matrix::readMM(file.path(data_dir, "matrix.mtx")), "dgCMatrix")
+  genes <- read.delim(file.path(data_dir, "genes.tsv"), sep = "\t", header = FALSE, col.names = c("pacBio", "ensembl")) %>%
+    mutate(pacBio = sub(":.*", "", pacBio),
+           ensembl = map_gene_ids(ensembl))
+  barcodes <- read.delim(file.path(data_dir, "barcodes.tsv"), sep = "\t", header = FALSE, col.names = "barcode")
+  barcodes_rev <- read.delim(file.path(data_dir, paste0(sample, "_barcodesRev.txt")), sep = "\t", header = TRUE) %>%
+    mutate(barcode = paste0(BC, "-1"))
+  
+  # Align barcodes and counts
+  barcodes <- left_join(barcodes, barcodes_rev, by = "barcode")
+  colnames(counts) <- paste0(barcodes$BCrev, "-", short_read_name)
+  rownames(counts) <- genes$ensembl
+  
+  # Filter columns based on shortRead data
+  valid_cells <- colnames(counts) %in% colnames(shortRead)
+  counts_filtered <- counts[, valid_cells]
+  
+  # Print the number of removed columns
+  print(paste("Removed", sum(!valid_cells), "columns for sample:", sample))
+  
+  return(counts_filtered)
+}
+
+# Function to process and combine data
+process_all_samples <- function(samples, dir, short_read_names) {
+  counts_list <- lapply(seq_along(samples), function(i) {
+    process_sample_data(samples[i], dir, short_read_names[i])
+  })
+  return(counts_list)
+}
+
+```
+
+
+# process data
+```{r}
+library(stringr)
+library(Seurat)
+library(Matrix)
+library(dplyr)
+library(ggplot2)
+library(rtracklayer)
+
+# setup
+dir_exome <- "~/School/longshort/R3_makeSeurat/exome_enriched"
+dir_no_enrich <- "~/School/longshort/R3_makeSeurat/no_enrichment"
+samples <- c("bcM0001", "bcM0002", "bcM0004")
+shortReadNames <- c("ALS_69", "ALS_72", "39_ALS_16")
+shortRead <- readRDS("~/School/longshort/John_finalQC_seurat_longReadSamples.rds")
+
+# Load GTF and prepare mapping
+gtf_df <- as.data.frame(import("~/School/longshort/gencode.v46.annotation.sorted.gtf"))
+gtf_unique <- gtf_df %>%
+  select(gene_id, gene_name) %>%
+  distinct(gene_id, .keep_all = TRUE)
+gene_id_to_name <- setNames(gtf_unique$gene_name, gtf_unique$gene_id)
+
+# Process exome enriched and non-enriched data
+counts_enr <- process_all_samples(samples, dir_exome, shortReadNames)
+counts_no_enr <- process_all_samples(samples, dir_no_enrich, shortReadNames)
+
+```
+
+
+# combine exome enriched and no enrichment into one object
+```{r}
+
+# Modify column names to append '-enr' for counts_enr and '-no_enr' for counts_no_enr
+modify_colnames <- function(counts_list, suffix) {
+  lapply(counts_list, function(counts) {
+    colnames(counts) <- paste0(colnames(counts), suffix)
+    return(counts)
+  })
+}
+
+# Apply the modification to counts_enr and counts_no_enr
+counts_enr <- modify_colnames(counts_enr, "-enr")
+counts_no_enr <- modify_colnames(counts_no_enr, "-no_enr")
+
+# Create Seurat object
+seurat_enr <- CreateSeuratObject(counts = counts_enr, min.cells = 0) 
+seurat_no_enr <- CreateSeuratObject(counts = counts_no_enr, min.cells = 0)
+final_merged <- merge(x = seurat_enr, y = seurat_no_enr)
+final_merged[["RNA"]] <- JoinLayers(final_merged[["RNA"]]) # needed for deseq2 later on
+
+# Save the sparse matrix to an RDS file
+saveRDS(final_merged, "~/School/longshort/R3_makeSeurat/merged_seurat.rds")
+
+```
+
+
+# combine short with long
+```{r}
+
+# duplicate metadata
+shortRead_metadata <- shortRead@meta.data
+duplicated_metadata <- shortRead_metadata
+duplicated_metadata2 <- shortRead_metadata
+
+# add exome enriched, short read, and non enriched suffix
+rownames(duplicated_metadata) <- paste0(rownames(duplicated_metadata), "-enr")
+rownames(duplicated_metadata2) <- paste0(rownames(duplicated_metadata2), "-no_enr")
+
+# combine metadata
+combined_metadata <- rbind(duplicated_metadata, duplicated_metadata2)
+combined_metadata <- combined_metadata[rownames(combined_metadata) %in% colnames(final_merged), ]
+combined_metadata <- combined_metadata[colnames(final_merged), ]
+final_merged@meta.data <- combined_metadata
+
+# add metadata
+suffixes <- str_extract(colnames(final_merged), "(?<=-)[^-]+$")
+final_merged@meta.data$enrichment <- suffixes
+
+# merge seurats
+shortRead[["RNA"]] <- JoinLayers(shortRead[["RNA"]]) 
+merged_reads <- merge(x = shortRead, y = final_merged)
+merged_reads<-runSeurat(merged_reads)
+saveRDS(merged_reads, file = "~/School/longshort/R3_makeSeurat/long_short_seurat.rds")
+
+# Clean up
+rm(list = ls(pattern = "counts_"))
+rm(duplicated_metadata, duplicated_metadata2, combined_metadata, shortRead_metadata, suffixes)
+
+```

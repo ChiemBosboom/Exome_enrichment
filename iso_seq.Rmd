@@ -1,0 +1,322 @@
+---
+title: "iso_seq"
+output: html_document
+date: "2025-03-03"
+---
+
+# 1: Getting started
+## 1.1 Set Environment
+```{bash, eval=FALSE}
+
+# set variables
+wrk=/hpc/hers_en/shared/chiem
+HIFIdir=$wrk/data/hifi_reads
+samples=(bcM0001 bcM0002 bcM0004)
+outDir=$wrk/data_analysis/exome_enriched    # or no_enrichment
+numberOfThreads=8
+n=$(($numberOfThreads / 2))
+
+```
+
+
+## 1.2 Make directories
+```{bash, eval=FALSE}
+
+mkdir ${outDir}; mkdir ${outDir}/segmentedReads; mkdir ${outDir}/logfiles; mkdir ${outDir}/lima_10xPrimerRemoval; mkdir ${outDir}/isoseq_tag_UMI_BC_clipping; mkdir ${outDir}/isoseq_refine_polyAremoval; mkdir ${outDir}/bcstats;mkdir ${outDir}/isoseq_correct_barcodeCorrection; mkdir ${outDir}/isoseq_groupdedup_deduplication; mkdir ${outDir}/pbmm2_alignment; mkdir ${outDir}/isoseq_collapse_redundancyRemoval; mkdir ${outDir}/pigeon_classify; mkdir $outDir/fastqc; mkdir $outDir/pigeon_make_seurat; mkdir $outDir/SQANTI3
+
+```
+
+
+# 2: Split Circular Consesus (CCS) Reads  / HiFi reads into segmented reads (S-reads) using Skera
+Make the ccs reads into s-reads using skera's split function
+```{bash, eval=FALSE}
+adapters=/hpc/hers_en/cvandijk/longRead_singleNucleus/pipeline/requiredFiles/mas16_primers.fasta
+prefixHIFI=m84192_240503_153246_s4.hifi_reads
+
+for sample in ${samples[@]}
+  do
+echo -e "\
+#!/bin/bash
+skera split -j $numberOfThreads ${HIFIdir}/${prefixHIFI}.${sample}.bam ${adapters} ${outDir}/segmentedReads/${sample}.skera.bam" | sbatch --time 24:00:00 --mem 3G --job-name skera.${sample} -o $outDir/logfiles/skera.${sample}.log -e $outDir/logfiles/skera.${sample}.log --cpus-per-task ${n}
+  done
+  
+```
+
+
+# 3: Remove 10x 3' kit primers using lima
+>fivePrime_5p
+AAGCAGTGGTATCAACGCAGAGTACATGGG
+>threePrime_3p
+AGATCGGAAGAGCGTCGTGTAG
+
+```{bash, eval=FALSE}
+primers=/hpc/hers_en/cvandijk/longRead_singleNucleus/pipeline/requiredFiles/10x_threePrime_kit_primers.fasta
+
+for sample in ${samples[@]}
+  do
+echo -e "\
+#!/bin/bash
+lima -j ${numberOfThreads} --per-read --isoseq ${outDir}/segmentedReads/${sample}.skera.bam ${primers} ${outDir}/lima_10xPrimerRemoval/${sample}.lima.bam" | sbatch --time 06:00:00 --mem 1G --job-name lima.${sample} -o $outDir/logfiles/lima.${sample}.log -e $outDir/logfiles/lima.${sample}.log --cpus-per-task ${n}
+  done
+  
+```
+
+
+# 4: Clip UMI/Cell Barcode using isoseq tag
+For example, the 10x 3’ (v3.1) kit has a 12bp UMI and 16bp BC on the 3’ end, so the design would be --design T-12U-16B.
+```{bash, eval=FALSE}
+
+for sample in ${samples[@]}
+  do
+echo -e "\
+#!/bin/bash
+isoseq tag -j ${numberOfThreads} ${outDir}/lima_10xPrimerRemoval/${sample}.lima.fivePrime_5p--threePrime_3p.bam ${outDir}/isoseq_tag_UMI_BC_clipping/${sample}.isoseq.tag.bam --design T-12U-16B" | sbatch --time 06:00:00 --mem 1G --job-name isoseq.tag.${sample} -o $outDir/logfiles/isoseq.tag.${sample}.log -e $outDir/logfiles/isoseq.tag.${sample}.log --cpus-per-task ${n}
+  done
+  
+```
+
+
+# 5: Remove poly(A) tails and concatemer using isoseq refine
+```{bash, eval=FALSE}
+primers=/hpc/hers_en/cvandijk/longRead_singleNucleus/pipeline/requiredFiles/10x_threePrime_kit_primers.fasta
+
+for sample in ${samples[@]}
+  do
+echo -e "\
+#!/bin/bash
+isoseq refine -j ${numberOfThreads} ${outDir}/isoseq_tag_UMI_BC_clipping/${sample}.isoseq.tag.bam ${primers} ${outDir}/isoseq_refine_polyAremoval/${sample}.isoseq.refine.bam --require-polya " | sbatch --time 06:00:00 --mem 1G --job-name isoseq.refine.${sample} -o $outDir/logfiles/isoseq.refine.${sample}.log -e $outDir/logfiles/isoseq.refine.${sample}.log --cpus-per-task ${n}
+  done
+  
+```
+
+
+# 6:  Cell Barcode Correction and Real Cell Identification using isoseq correct
+## Run bcstats to get % determine optimal percentage:https://isoseq.how/umi/cell-calling.html
+
+srun  --time 4:00:00 --mem 20G --pty bash
+```{bash, eval=FALSE}
+
+for sample in ${samples[@]}
+  do
+isoseq bcstats -o ${outDir}/bcstats/${sample}.isoseq.refine.tsv ${outDir}/isoseq_refine_polyAremoval/${sample}.isoseq.refine.bam 
+  done
+  
+```
+
+## get the required files
+```{bash, eval=FALSE}
+samples=(bcM0001 bcM0002 bcM0004)
+dir=/hpc/hers_en/shared/chiem/data_analysis/exome_enriched/bcstats
+
+cd C:/Users/chiem/Documents/School/longshort                 
+
+mkdir R1_bcstats
+cd R1_bcstats
+mkdir exome_enriched
+cd exome_enriched
+
+for sample in ${samples[@]}
+  do
+    /usr/bin/rsync -av -e "ssh -v -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" --progress gw2hpct04:${dir}/${sample}.isoseq.refine.tsv ${sample}.isoseq.refine.tsv
+  done
+
+# run plot_knees and determine best percentage
+wgett https://downloads.pacbcloud.com/public/dataset/MAS-Seq/PLOT-scripts/plot_knees.py
+for sample in ${samples[@]}
+  do
+python plot_knees.py --tsv ${sample}.isoseq.refine.tsv --output ${sample} --estimate_percentile 90
+  done
+  
+```
+
+
+## 6.2 Run isoseq correct with this percentage (95%)
+```{bash, eval=FALSE}
+barcodes=/hpc/hers_en/cvandijk/longRead_singleNucleus/pipeline/requiredFiles/10xMultiome/gex_737K-arc-v1_reverse_complements.txt
+
+for sample in ${samples[@]}
+  do
+input=${outDir}/isoseq_refine_polyAremoval/${sample}.isoseq.refine.bam
+output=${outDir}/isoseq_correct_barcodeCorrection/${sample}.isoseq.correct.bam
+echo -e "\
+#!/bin/bash
+isoseq correct --method percentile --percentile 95 --barcodes ${barcodes} \
+--log-level INFO --log-file ${outDir}/logfiles/${sample}.isoseq_correct.log \
+${input} ${output}" | sbatch --time 4:00:00 --mem 20G --job-name isoseq.correct.${sample} -o /dev/null -e /dev/null
+  done
+  
+```
+
+
+# 7: Deduplication via UMI and cell barcode clustering using isoseq groupdedup
+
+srun  --time 4:00:00 --mem 20G --pty bash
+```{bash, eval=FALSE}
+
+outDir=$wrk/data_analysis/exome_enriched/ 
+samples=(bcM0001 bcM0002 bcM0004)
+
+# Sort the reads by cell barcode
+for sample in ${samples[@]}
+  do
+samtools sort -t CB ${outDir}/isoseq_correct_barcodeCorrection/${sample}.isoseq.correct.bam -o ${outDir}/isoseq_correct_barcodeCorrection/${sample}.isoseq.correct.sorted.bam
+  done
+
+# Run deduplication
+for sample in ${samples[@]}
+  do
+echo -e "\
+#!/bin/bash
+isoseq groupdedup -v --log-level INFO --log-file ${outDir}/isoseq_groupdedup_deduplication/${sample}.dedup.log \
+    -j 8 ${outDir}/isoseq_correct_barcodeCorrection/${sample}.isoseq.correct.sorted.bam \
+    ${outDir}/isoseq_groupdedup_deduplication/${sample}.dedup.bam" | sbatch --time 24:00:00 --mem 8G --cpus-per-task=4 --job-name isoseq.groupdedup.${sample} \
+    -o $outDir/logfiles/isoseq.groupdedup.${sample}.log \
+    -e $outDir/logfiles/isoseq.groupdedup.${sample}.log
+  done
+  
+```
+
+
+Align to the genome
+```{bash, eval=FALSE}
+ref=/hpc/hers_en/cvandijk/longRead_singleNucleus/pipeline/requiredFiles/human_GRCh38_no_alt_analysis_set.fasta
+
+for sample in ${samples[@]}
+  do
+echo -e "\
+#!/bin/bash  
+pbmm2 align --preset ISOSEQ --sort --log-level INFO --log-file ${outDir}/pbmm2_alignment/${sample}.pbmm2.log ${outDir}/isoseq_groupdedup_deduplication/${sample}.dedup.bam $ref ${outDir}/pbmm2_alignment/${sample}.pbmm2.aligned.bam" | sbatch --time 20:00:00 --mem 55G --gres=tmpspace:10G --job-name pbmm2.${sample} -o $outDir/logfiles/pbmm2.alignment.${sample}.log -e $outDir/logfiles/pbmm2.alignment.${sample}.log 
+  done
+  
+```
+
+
+## use feature counts to get number of usable reads (overlapping exons)
+```{bash}
+gtf=/hpc/hers_en/cvandijk/longRead_singleNucleus/pipeline/requiredFiles/gencode.v46.annotation.sorted.gtf
+
+for sample in ${samples[@]}
+  do
+featureCounts -L -T 4 -a $gtf -o counts_${sample}.txt ${outDir}/isoseq_groupdedup_deduplication/${sample}.dedup.bam -t exon -g gene_id
+  done
+
+```
+
+
+# isoseq stats plot
+# stats are from various summary files provided by isoseq and manually compiled in isoseq_stats.csv
+```{r}
+library(ggplot2)
+library(tidyr) 
+library(dplyr) 
+library(colorspace) 
+
+# Make sure path is correct
+stats <- read.csv("~/School/longshort/isoseq_stats.csv", sep = ";")
+stats <- stats[1:6, ] 
+
+# Remove sample_nr 1
+stats_filtered <- stats %>%
+  filter(sample_nr != 1) # Assuming this leaves you with 2 unique sample_nr values
+
+# Perform the data manipulation
+result <- stats_filtered %>%
+  # Remove columns ending in '_pct', and specific columns 'sample_id', 'sample_nr'
+  select(
+    -ends_with("_pct"),
+    -sample_id,
+    -sample_nr
+  ) %>%
+  # Group by the 'enriched' column
+  group_by(enriched) %>%
+  # Sum all remaining numeric columns within each group
+  summarise(across(where(is.numeric), sum, na.rm = TRUE))
+
+
+# Define the sequence of steps and their corresponding columns
+step_definitions <- list(
+  list(name = "Primer Removal",     total_col = "split",           kept_col = "primer_rm"),
+  list(name = "Tagging",            total_col = "primer_rm",       kept_col = "tag"),
+  list(name = "Refining",           total_col = "tag",             kept_col = "refine"),
+  list(name = "Barcode Correction", total_col = "refine",          kept_col = "barcode_correct"),
+  list(name = "Real Cell ID",       total_col = "barcode_correct", kept_col = "real_cell_id"),
+  list(name = "Deduplication",      total_col = "real_cell_id",    kept_col = "dedup"),
+  list(name = "Gene Mapping",       total_col = "dedup",           kept_col = "mapped")
+)
+
+# Create the long format data
+plot_data_long_list <- lapply(step_definitions, function(step_def) {
+  data.frame(
+    enriched = result$enriched,
+    step_name = step_def$name,
+    total_value = result[[step_def$total_col]], # Value for the outer bar
+    kept_value = result[[step_def$kept_col]]    # Value for the inner bar
+  )
+})
+plot_data_long <- do.call(rbind, plot_data_long_list)
+
+# Convert step_name to a factor to ensure correct order on the x-axis
+plot_data_long$step_name <- factor(
+  plot_data_long$step_name,
+  levels = sapply(step_definitions, function(x) x$name) # Order as defined above
+)
+
+# --- Color and Alpha Definitions (same as before) ---
+user_base_colors <- c("ExoLR" = "#FF7F0E", "LR" = "#1F77B4")
+fill_colors_for_enrichment <- c(
+  "yes" = unname(user_base_colors["ExoLR"]),
+  "no"  = unname(user_base_colors["LR"])
+)
+alpha_values_for_layers <- c(
+  "total_bar_shows_removed" = 0.5,
+  "kept_bar"                = 0.9
+)
+alpha_legend_labels <- c(
+  "total_bar_shows_removed" = "Lost", # Renamed for clarity with multiple steps
+  "kept_bar"                = "Kept" # Renamed for clarity
+)
+
+# --- Create the Plot ---
+ggplot(plot_data_long, aes(x = step_name, fill = enriched)) +
+  # Outer Bar: Represents 'total_value' for the step
+  geom_bar(
+    aes(y = total_value, alpha = "total_bar_shows_removed"),
+    stat = "identity",
+    position = position_dodge(width = 0.6), # Dodges "yes" and "no" groups
+    width = 0.6 # Width of the individual outer bars (adjust as needed)
+  ) +
+  # Inner Bar: Represents 'kept_value' for the step
+  geom_bar(
+    aes(y = kept_value, alpha = "kept_bar"),
+    stat = "identity",
+    position = position_dodge(width = 0.6), # Must match the dodge above
+    width = 0.6  # Width of the individual inner bars (must be < outer bar width)
+  ) +
+  # Scale for Fill: Controls Enrichment colors and legend
+  scale_fill_manual(
+    name = "",
+    values = fill_colors_for_enrichment,
+    labels = c("yes" = "ExoLR", "no" = "LR")
+  ) +
+  # Scale for Alpha: Controls transparency and legend
+  scale_alpha_manual(
+    name = "", # Updated legend title
+    values = alpha_values_for_layers,
+    labels = alpha_legend_labels
+  ) +
+  # X-axis labels and title
+  scale_x_discrete(
+    name = "" # Overall x-axis title
+    # labels will be the step_name values by default
+  ) +
+  labs(
+    title = "",
+    y = "Read Count"
+    # x-axis title is handled by scale_x_discrete
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1) # Rotate x-axis labels if they overlap
+  )
+
+```

@@ -1,0 +1,123 @@
+---
+title: "consensus"
+output: html_document
+date: "2025-02-25"
+---
+
+# install
+```{bash}
+
+#install apptainer
+conda install conda-forge::apptainer
+
+# set directories for apptainer (VERY IMPORTANT)
+export APPTAINER_CACHEDIR=$wrk/.apptainer_cache
+export APPTAINER_TMPDIR=$wrk/apptainer_tmp
+mkdir -p $APPTAINER_CACHEDIR $APPTAINER_TMPDIR 
+
+# get deepvariant
+apptainer pull docker://google/deepvariant:latest
+
+# need squashfuse to run
+conda install conda-forge::squashfuse 
+
+# get longshot
+conda install longshot
+
+```
+
+
+# Make fake neccesary quality scores for deduplicated reads
+# run deepvariant
+```{bash}
+
+# variables
+ref=${wrk}/data_analysis/consensus/human_GRCh38_no_alt_analysis_set.fasta
+samples=(bcM0001 bcM0002 bcM0004)
+enrichment=exome_enriched # and no_enrichment
+
+# make fake QC scores
+for sample in "${samples[@]}"; do
+    sbatch --time=4:00:00 --mem=8G --job-name=qual.${sample} --wrap="\
+        samtools view -h data_analysis/${enrichment}/pbmm2_alignment/${sample}.pbmm2.aligned.anno.bam | \
+        awk 'BEGIN {OFS=\"\t\"} /^@/ {print; next} { \$11 = gensub(/./, \"I\", \"g\", \$10); print }' | \
+        samtools view -b -o data_analysis/${enrichment}/pbmm2_alignment/${sample}.pbmm2.aligned.anno.qual.bam"
+done
+
+# index
+for sample in ${samples[@]}
+  do
+samtools index ${wrk}/data_analysis/${enrichment}/pbmm2_alignment/${sample}.pbmm2.aligned.anno.qual.bam
+  done
+  
+# need to create a sequence dictionary for a reference FASTA
+gatk-4.2.0.0/gatk CreateSequenceDictionary -R ${ref}
+
+# run deepvariant
+for sample in "${samples[@]}"; do
+  export TMPDIR=/hpc/hers_en/shared/chiem/data_analysis/consensus/${sample}_dedup/tmp
+  mkdir -p "$TMPDIR"
+  echo -e "\
+#!/bin/bash
+export TMPDIR=/data/consensus/${sample}_dedup/tmp
+apptainer exec \\
+  --bind /hpc/hers_en/shared/chiem/data_analysis:/data \\
+  data_analysis/consensus/deepvariant_latest.sif \\
+  /opt/deepvariant/bin/run_deepvariant \\
+    --logging_dir=/data/consensus/${sample}_dedup \\
+    --model_type=MASSEQ \\
+    --ref=/data/consensus/human_GRCh38_no_alt_analysis_set.fasta \\
+    --reads=/data/exome_enriched/pbmm2_alignment/${sample}.pbmm2.aligned.anno.qual.bam,/data/no_enrichment/pbmm2_alignment/${sample}.pbmm2.aligned.anno.qual.bam \\
+    --output_vcf=/data/consensus/${sample}_dedup/${sample}_dedup.output.vcf.gz \\
+    --num_shards=8 \\
+    --intermediate_results_dir=/data/consensus/${sample}_dedup \\
+    --sample_name ${sample}_dedup \\
+    --vcf_stats_report" \
+  | sbatch --time=48:00:00 --mem=16G --job-name=cons.${sample}_dedup \
+      -o "$wrk/data_analysis/consensus/consensus.${sample}_dedup.log" \
+      -e "$wrk/data_analysis/consensus/consensus.${sample}_dedup.log" \
+      --cpus-per-task=8
+done
+
+```
+
+
+# now give this vcf to longshot
+```{bash}
+
+# variables
+ref=${wrk}/data_analysis/consensus/human_GRCh38_no_alt_analysis_set.fasta
+samples=(bcM0001 bcM0002 bcM0004)
+enrichment=exome_enriched # and no_enrichment
+
+# clean vcfs to only inlcude passed variants
+for sample in "${samples[@]}"; do
+  echo "filtering VCF files for sample: $sample"
+  bcftools view -i 'FILTER=="PASS"' data_analysis/consensus/${sample}_dedup/${sample}_dedup.output.vcf.gz -Oz -o data_analysis/consensus/${sample}_dedup/${sample}_dedup.output.filtered.vcf.gz
+  bcftools index data_analysis/consensus/${sample}_dedup/${sample}_dedup.output.filtered.vcf.gz
+done
+
+# use vep to annotate (used for differential expression analysis)
+for sample in "${samples[@]}"; do
+  echo -e "\
+#!/bin/bash
+  vep \
+    -i data_analysis/consensus/${sample}_dedup/${sample}_dedup.output.filtered.vcf.gz \
+    --cache --offline \
+    --dir_cache $wrk/reference \
+    --assembly GRCh38 \
+    --fasta $ref \
+    --vcf \
+    --symbol \
+    -o data_analysis/consensus/${sample}_dedup/${sample}_dedup.output.filtered.annotated.vcf.gz" | sbatch --time=8:00:00 --mem=16G --job-name=${sample}.anno
+done
+
+
+# run longshot
+for sample in "${samples[@]}"; do
+  echo -e "\
+#!/bin/bash
+longshot --auto_max_cov --potential_variants data_analysis/consensus/${sample}_dedup/${sample}_dedup.output.filtered.vcf.gz --out_bam data_analysis/consensus/longshot/${enrichment}.${sample}.longshot.bam --sample_id ${enrichment}.${sample} --bam data_analysis/${enrichment}/pbmm2_alignment/${sample}.pbmm2.aligned.anno.qual.bam --ref $ref --out data_analysis/consensus/longshot/${enrichment}.${sample}.longshot_output.vcf" | sbatch --time=8:00:00 --mem=16G --job-name=${enrichment}.${sample}.longshot -o "$wrk/data_analysis/consensus/longshot/${enrichment}.${sample}.longshot.log" -e "$wrk/data_analysis/consensus/longshot/${enrichment}.${sample}.longshot.log"
+done
+
+```

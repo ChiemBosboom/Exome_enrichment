@@ -1,0 +1,1856 @@
+---
+title: "counts"
+output: html_document
+date: "2025-03-03"
+---
+
+# note this is the workflow for exome enriched reads. No enrichment goes through the exact same workflow, simply replace every occurance of exome_enriched with no_enrichment
+
+# setup for deseq2 for differential expression pseudobulk
+# https://hbctraining.github.io/scRNA-seq/lessons/pseudobulk_DESeq2_scrnaseq.html
+```{r}
+library(Seurat)
+library(SingleCellExperiment)
+library(scuttle)
+library(DESeq2)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+library(pheatmap)
+library(Matrix)
+library(RColorBrewer)
+library(reshape2)
+library(S4Vectors)
+library(rtracklayer)
+library(tidyr)
+library(glmnet)
+library(glue)
+library(gt)
+library(rstatix)
+library(ggpubr)  
+
+
+# Bring in Seurat object
+seurat <- readRDS("~/School/longshort/R3_makeSeurat/long_short_seurat.rds")
+
+# Set up metadata as desired for aggregation and DE analysis
+seurat@meta.data$enrichment[is.na(seurat@meta.data$enrichment)] <- "short"
+seurat@meta.data$enrichment <- factor(seurat@meta.data$enrichment)
+levels(seurat$enrichment) <- c("ExoLR", "LR", "SR")
+seurat@meta.data$sample <- factor(seurat@meta.data$sample)
+levels(seurat$sample) <- c("4", "1", "2")
+seurat@meta.data$sample_id <- factor(paste(seurat@meta.data$enrichment, seurat@meta.data$sample, sep = "."))
+
+# remove sample bcM0001 (optional)
+seurat <- subset(seurat, subset = sample_id != "ExoLR.1")
+seurat <- subset(seurat, subset = sample_id != "LR.1")
+seurat <- subset(seurat, subset = sample_id != "SR.1")
+
+# Make sure cells are shared within samples
+y <- split(seurat@meta.data[["X"]], seurat@meta.data$enrichment)
+x <- Reduce(intersect, y)
+keep_cells <- which(seurat@meta.data[["X"]] %in% x)
+seurat <- subset(seurat, cells = rownames(seurat@meta.data)[keep_cells])
+
+# Extract raw counts and metadata to create SingleCellExperiment object
+seurat[["RNA"]] <- JoinLayers(seurat[["RNA"]])
+sce <- as.SingleCellExperiment(seurat)
+sce_aggregated <- aggregateAcrossCells(sce, ids = colData(sce)$sample_id)
+sce_aggregated <- sce_aggregated[rowSums(counts(sce_aggregated)) > 0, ]
+
+# Access the aggregated counts matrix
+aggregated_counts <- assay(sce_aggregated, "counts")
+
+# get dds
+dds <- DESeqDataSetFromMatrix(countData = aggregated_counts,
+                              colData = colData(sce_aggregated),
+                              design = ~ enrichment)
+
+```
+
+
+# PCA and hierarchichal clustering reveal outliers
+```{r}
+
+# Transform counts for data visualization
+rld <- rlog(dds, blind=TRUE)
+
+# Extract PCA data
+pca_data <- plotPCA(rld, intgroup = c("enrichment", "sample"), returnData = TRUE)
+
+# Compute percentage variance
+pca_variance <- round(100 * attr(pca_data, "percentVar"))
+
+# Custom PCA plot with variance percentages in axis labels
+ggplot(pca_data, aes(PC1, PC2, color = enrichment, shape = sample)) +
+  geom_point(size = 3) + 
+  theme_minimal() +
+  labs(
+    x = paste0("PC1: ", pca_variance[1], "% variance"),
+    y = paste0("PC2: ", pca_variance[2], "% variance")
+  )
+
+# Extract the rlog matrix from the object and compute pairwise correlation values
+rld_mat <- assay(rld)
+rld_cor <- cor(rld_mat)
+
+# Plot expanded heatmap
+pheatmap(rld_cor, annotation = as.data.frame(dds@colData[, c('enrichment'), drop=F]))
+
+```
+
+
+# run DESeq2
+```{r}
+
+# remove low expression features
+keep_samples <- colData(dds)$enrichment %in% c("ExoLR", "LR")
+counts_subset <- counts(dds)[, keep_samples]
+counts_subset <- counts_subset[rowSums(counts_subset) > 0, ]
+ngenes <- nrow(counts_subset)
+
+# how many features are represented in each samples
+non_zero_counts <- apply(counts_subset, 2, function(col) sum(col > 0))
+
+# 2. Print the results in a user-friendly way
+cat("Number of features with expression > 0 in each column:\n")
+for (col_name in names(non_zero_counts)) {
+  count <- non_zero_counts[col_name] # Get the count for the current column
+  cat(" - ", col_name, ": ", count, "\n", sep = "") # Print name and count
+}
+
+# remove low expression genes
+counts_subset <- as.data.frame(counts_subset) %>%
+  filter(rowSums(. > 0) >= 2 & rowSums(.) > 10)
+
+glue('Removed {ngenes - nrow(counts_subset)} genes with low expression out of {ngenes}')
+dds <- dds[rownames(dds) %in% rownames(counts_subset), ]
+
+# run DESeq
+dds <- DESeq(dds)
+plotDispEsts(dds)
+
+# get results from dds
+res <- results(dds, name="enrichment_LR_vs_ExoLR")
+
+res_tbl <- res %>%
+        data.frame() %>%
+        rownames_to_column(var="gene") %>%
+        as_tibble()
+
+# Set thresholds
+padj_cutoff <- 0.05
+
+# Subset the significant results
+sig_res <- dplyr::filter(res_tbl, padj < padj_cutoff) %>%
+        dplyr::arrange(padj)
+
+# ggplot of top genes
+normalized_counts <- counts(dds, normalized = TRUE)
+
+# Extract normalized counts for only the significant genes
+sig_norm <- data.frame(normalized_counts) %>%
+        rownames_to_column(var = "gene") %>%
+        dplyr::filter(gene %in% sig_res$gene)
+
+# Set a color palette
+heat_colors <- brewer.pal(6, "YlOrRd")
+
+# Run pheatmap using the metadata data frame for the annotation
+pheatmap(sig_norm[ , 2:length(colnames(sig_norm))], 
+    color = heat_colors, 
+    cluster_rows = T, 
+    show_rownames = F,
+    annotation_col = as.data.frame(dds@colData[, c('enrichment'), drop=F]),
+    border_color = NA, 
+    fontsize = 10, 
+    scale = "row", 
+    fontsize_row = 10, 
+    height = 20)  
+
+sizeFactors(dds)
+
+```
+
+
+# https://www.ensembl.org/biomart/martview/3b7f7863c35a2234bff9158cde49fd8d
+# Gene % GC content,Gene name
+# process gtf file and biomart file for info per gene
+```{r}
+
+# get data
+gtf_df <- as.data.frame(import("~/School/longshort/gencode.v46.annotation.sorted.gtf"))
+
+# unique exons only
+gtf_df_unique <- gtf_df %>%
+  filter((is.na(exon_id) | !duplicated(exon_id)) & type == "exon")
+
+# Convert to GRanges
+gr <- makeGRangesFromDataFrame(
+  gtf_df_unique,
+  keep.extra.columns = TRUE 
+)
+
+# Split by gene_id and merge overlapping ranges
+merged_exons <- gr %>%
+  split(.$gene_id) %>%             # Split into a GRangesList by gene_id
+  GenomicRanges::reduce() %>%      # Merge overlapping intervals
+  unlist()                         # Combine back into a single GRanges
+
+# Convert to dataframe (optional)
+merged_exons_df <- as.data.frame(merged_exons, row.names = NULL)
+
+merged_exons_df$gene_id <- merged_exons@ranges@NAMES
+
+transcript_summary <- merged_exons_df %>%
+  group_by(gene_id) %>%
+  summarize(
+    width = sum(width),  # Sum exon widths
+    across(
+      .cols = -c(width), 
+      .fns = ~ .x[1]  # Take the first element of non-width columns
+    )
+  )
+
+gene_df <- gtf_df %>%
+  filter(type == "gene")
+
+# Ensure gene_id is unique in gene_df 
+transcript_summary_merged <- transcript_summary %>%
+  left_join(
+    gene_df %>%
+      dplyr::select(gene_id, gene_width = width, gene_name, tag, gene_type),
+    by = "gene_id"
+  )
+
+# add exon content column
+transcript_summary_merged <- transcript_summary_merged %>%
+  mutate(exon_content = width / gene_width)
+
+# remove any duplicat gene names
+transcript_summary_uniq <- transcript_summary_merged %>%
+  distinct(gene_name, .keep_all = TRUE)
+
+# add biomart gene attributes
+df <- read.csv("~/School/longshort/mart_export.txt", sep = ",", header = TRUE, stringsAsFactors = FALSE)
+
+# remove duplicates and empty gene names
+df <- df[df$Gene.name != "", ]
+df <- df[!duplicated(df$Gene.name), ]
+
+# add biomart data
+gene_info <- transcript_summary_uniq %>%
+  left_join(df, by = c("gene_name" = "Gene.name"))
+
+# rename
+gene_info <- gene_info %>% dplyr::rename(GC_content = Gene...GC.content)
+
+# change for consistency 
+gene_info <- gene_info %>%
+  mutate(
+    GC_content = GC_content / 100 # Convert percentage to 0-1 scale
+  )
+
+# clean up
+rm(gr, merged_exons_df, merged_exons, gtf_df, gtf_df_unique, transcript_summary, transcript_summary_merged, gene_df, df, transcript_summary_uniq)
+
+# save or load
+saveRDS(gene_info, file = '~/School/longshort/gene_info.rds')
+gene_info  <- readRDS('~/School/longshort/gene_info.rds')  
+
+```
+
+
+# process vcf to get mutation score
+```{r}
+library(VariantAnnotation)
+library(stringr)
+library(parallel)
+library(tidyverse)
+library(vcfR)
+library(bigPint)  
+
+
+# Define a function to process a single sample
+process_sample <- function(sample_name) {
+  vcf_file <- paste0("~/School/longshort/deepvariant/", sample_name, "_dedup.output.filtered.annotated.vcf")
+  
+  # Read in the VCF file (this may be memory intensive)
+  vcf <- read.vcfR(vcf_file, "hg38")
+  
+  # Convert VCF to data frame and parse INFO
+  vcf_df <- vcf@fix %>% 
+    as_tibble() %>% 
+    separate_rows(INFO, sep = ";") %>% 
+    separate(INFO, into = c("INFO_KEY", "INFO_VALUE"), sep = "=", extra = "merge") %>% 
+    pivot_wider(names_from = "INFO_KEY", values_from = "INFO_VALUE")
+  
+  # Free memory from the VCF object now that we have a data frame
+  rm(vcf)
+  gc()
+  
+  # Extract exonic variants with VEP annotations
+  exonic_variants <- vcf_df %>%
+    mutate(CSQ_entries = str_split(CSQ, ",")) %>% 
+    unnest_longer(CSQ_entries) %>% 
+    separate(CSQ_entries, into = c(
+      "Allele", "Consequence", "IMPACT", "SYMBOL", "Gene", "Feature_type", "Feature",
+      "BIOTYPE", "EXON", "INTRON", "HGVSc", "HGVSp", "cDNA_position", "CDS_position",
+      "Protein_position", "Amino_acids", "Codons", "Existing_variation", "DISTANCE",
+      "STRAND", "FLAGS", "SYMBOL_SOURCE", "HGNC_ID"
+    ), sep = "\\|") %>% 
+    filter(EXON != "") %>% 
+    distinct(CHROM, POS, REF, ALT, .keep_all = TRUE)
+  
+  # Remove the full VCF data frame if no longer needed
+  rm(vcf_df)
+  gc()
+  
+  # Classify variants into mismatches, insertions, deletions
+  exonic_variants <- exonic_variants %>%
+    mutate(
+      variant_type = case_when(
+        nchar(REF) == 1 & nchar(ALT) == 1 ~ "mismatch",
+        nchar(ALT) > nchar(REF) ~ "insertion",
+        nchar(REF) > nchar(ALT) ~ "deletion",
+        TRUE ~ "other"
+      )
+    )
+  
+  # Calculate variant counts per gene
+  variant_stats <- exonic_variants %>%
+    group_by(SYMBOL) %>%
+    summarise(
+      mismatches = sum(variant_type == "mismatch"),
+      insertions = sum(variant_type == "insertion"),
+      deletions = sum(variant_type == "deletion"),
+      .groups = "drop"
+    )
+  
+  # Get gene lengths for joining
+  gene_lengths <- gene_info %>%
+    distinct(gene_name, .keep_all = TRUE) %>%
+    select(SYMBOL = gene_name, total_exon_length = width) %>%
+
+  # Join variant counts with gene lengths and calculate identity
+  gene_identity <- variant_stats %>%
+    left_join(gene_lengths, by = "SYMBOL") %>%
+    mutate(
+      mutations = mismatches + insertions + deletions,
+      matches = total_exon_length - mutations,
+      identity = 100 * matches / (matches + mutations)
+    ) %>%
+    filter(!is.na(total_exon_length))
+  
+  # Optionally, add sample name as a suffix to columns (except SYMBOL)
+  gene_identity <- gene_identity %>%
+    rename_with(~ paste0(., "_", sample_name), -SYMBOL)
+  
+  # Remove large intermediate objects
+  rm(exonic_variants, variant_stats, gene_lengths)
+  gc()
+  
+  # Optionally, write the result to disk to free memory
+  # write_csv(gene_identity, paste0("tmp_", sample_name, ".csv"))
+  
+  return(gene_identity)
+}
+
+# List of sample names
+samples <- c("bcM0001", "bcM0002", "bcM0004")
+
+# Limit the number of cores to reduce memory load (e.g., use 2 cores)
+num_cores <- min(2, detectCores() - 1)
+cl <- makeCluster(num_cores)
+
+# Export necessary objects and libraries to the cluster workers
+clusterExport(cl, varlist = c("process_sample", "gene_info"))
+clusterEvalQ(cl, {
+  library(tidyverse)
+  library(vcfR)
+})
+
+# Process samples in parallel using a limited number of cores
+sample_results <- parLapply(cl, samples, function(sample_name) {
+  result <- process_sample(sample_name)
+  # Free memory explicitly on the worker after processing each sample
+  rm(sample_name)
+  gc()
+  return(result)
+})
+
+# Shut down the cluster
+stopCluster(cl)
+
+# save / load in the file
+saveRDS(sample_results, "~/School/longshort/deepvariant/mutation.rds")
+sample_results <- readRDS("~/School/longshort/deepvariant/mutation.rds")
+
+# combine results and add to gene info
+combined_results <- Reduce(function(x, y) full_join(x, y, by = "SYMBOL"), sample_results)
+
+# --- Configuration ---
+remove_bcM0001 <- TRUE # Set to TRUE to remove, FALSE to keep
+
+# --- Process and Join ---
+processed_identities <- combined_results %>%
+  dplyr::select(SYMBOL, matches("^identity_")) %>% # Select relevant columns
+  { if (remove_bcM0001 && "identity_bcM0001" %in% names(.)) dplyr::select(., -identity_bcM0001) else . } %>% # Optionally remove bcM0001
+  mutate(across(starts_with("identity_"), ~ . / 100)) # Divide remaining identities by 100
+
+gene_info <- gene_info %>%
+  left_join(processed_identities, by = c("gene_name" = "SYMBOL")) # Join back
+
+```
+
+
+# Remove non-targeted genes
+```{r}
+
+# Import target genes and filter for those present in the dataset
+target_genes <- readLines("~/School/longshort/S33613271_Targets.txt")
+target_genes <- target_genes[target_genes %in% rownames(normalized_counts)]
+non_target_genes <- setdiff(rownames(normalized_counts), target_genes)
+
+# Get normalized counts matrix
+vst <- vst(dds, blind=FALSE)
+normalized_counts <- as.data.frame(assay(vst))
+
+# ---- Gene Set Definitions ----
+# Filter target genes present in the dataset
+target_genes <- target_genes[target_genes %in% rownames(normalized_counts)]
+# Define non-target genes
+non_target_genes <- setdiff(rownames(normalized_counts), target_genes)
+# Ensure we have genes in each set (important if target_genes list is small/empty)
+if(length(target_genes) == 0) {
+    warning("No target genes found in the normalized counts matrix. 'Target' category will be empty.")
+}
+if(length(non_target_genes) == 0) {
+    warning("No non-target genes found (all genes might be targets?). 'NonTarget' category will be empty.")
+}
+
+# Identify sample groups
+exo_cols <- grep("^ExoLR", colnames(normalized_counts), value = TRUE)
+lr_cols <- grep("^LR\\.", colnames(normalized_counts), value = TRUE)
+selected_cols <- c(exo_cols, lr_cols)
+
+# ---- Data Preparation ----
+# Create a function to process data for plotting
+prepare_long_data <- function(count_matrix, gene_set_name) {
+  # Handle case where count_matrix might be empty or have 0 rows
+  if (nrow(count_matrix) == 0) {
+    # Return an empty tibble with the expected structure
+    return(tibble(Gene = character(), Sample = character(), Expression = numeric(),
+                  Group = factor(levels = c("LR", "ExoLR")),
+                  log2_Expression = numeric(), GeneSet = character()))
+  }
+  count_matrix %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("Gene") %>%
+    tidyr::pivot_longer(
+      cols = -Gene,
+      names_to = "Sample",
+      values_to = "Expression" # Use VST values directly
+    ) %>%
+    dplyr::mutate(
+      Group = factor(
+        ifelse(grepl("^ExoLR", Sample), "ExoLR", "LR"),
+        levels = c("LR", "ExoLR")
+      ),
+      # Assuming VST is already log-like. If not, use log2(Expression + 1)
+      log2_Expression = Expression,
+      GeneSet = gene_set_name
+    )
+}
+
+# Prepare data for all three gene sets
+all_genes_data <- prepare_long_data(normalized_counts[, selected_cols], "All")
+non_target_data <- prepare_long_data(normalized_counts[non_target_genes, selected_cols], "NonTarget")
+target_data <- prepare_long_data(normalized_counts[target_genes, selected_cols], "Target")
+
+# Combine datasets for visualization and analysis
+combined_data <- dplyr::bind_rows(all_genes_data, non_target_data, target_data)
+
+# ---- Calculate Counts and Define Labels/Levels ----
+# Calculate number of unique genes in each GeneSet from the combined data
+gene_counts <- combined_data %>%
+  distinct(Gene, GeneSet) %>%
+  count(GeneSet) %>%
+  # Add counts for any sets that might be empty (if target_genes was empty)
+  tidyr::complete(GeneSet = c("All", "NonTarget", "Target"), fill = list(n = 0))
+
+# Create labels including counts
+# Handle case where a count might be 0
+gene_counts <- gene_counts %>%
+  mutate(
+    legend_label = case_when(
+      GeneSet == "All" ~ paste0("All Genes\n(n=", n, ")"),
+      GeneSet == "NonTarget" ~ paste0("Non-Target Genes\n(n=", n, ")"),
+      GeneSet == "Target" ~ paste0("Target Genes\n(n=", n, ")")
+    )
+  )
+
+# Define the desired order and labels for the plot's x-axis
+# Retrieve counts safely, handling potential missing sets if n=0
+n_all <- gene_counts$n[gene_counts$GeneSet == "All"] %||% 0
+n_nontarget <- gene_counts$n[gene_counts$GeneSet == "NonTarget"] %||% 0
+n_target <- gene_counts$n[gene_counts$GeneSet == "Target"] %||% 0
+
+plot_levels <- c(
+  paste0("All Genes\n(n=", n_all, ")"),
+  paste0("Non-Target Genes\n(n=", n_nontarget, ")"),
+  paste0("Target Genes\n(n=", n_target, ")")
+)
+
+# Prepare data with updated labels and factor levels
+# Ensure that even if a gene set is empty, the join doesn't fail
+combined_data <- combined_data %>%
+  left_join(gene_counts %>% dplyr::select(GeneSet, legend_label), by = "GeneSet") %>%
+  mutate(
+    # Use the new label column for the x-axis factor, ordered by plot_levels
+    GeneSetLabel = factor(legend_label, levels = plot_levels)
+  )
+
+# 1. Perform Wilcoxon tests independently within each GeneSetLabel
+#    Use p.adjust.method = "none" here, we adjust across tests later.
+stat_test_raw_p <- combined_data %>%
+  group_by(GeneSetLabel) %>%
+  filter(n_distinct(Group) == 2) %>% # Ensure both LR and ExoLR are present
+  filter(n() > 2) %>% # Ensure some data points exist
+  rstatix::wilcox_test(log2_Expression ~ Group, p.adjust.method = "none") %>%
+  # Keep relevant grouping info if needed later, but ungroup for adjustment
+  ungroup() # IMPORTANT: Remove grouping before adjusting across all tests
+
+# 2. Apply Bonferroni adjustment across all the calculated p-values
+stat_test <- stat_test_raw_p %>%
+  rstatix::adjust_pvalue(method = "bonferroni") %>% # Creates 'p.adj' column from 'p'
+  rstatix::add_significance(p.col = "p.adj") %>%
+  rstatix::add_xy_position(x = "GeneSetLabel", dodge = 0.8) # Adds 'p.adj.signif' based on 'p.adj'
+
+# Calculate effect size (rank biserial correlation)
+effect_size_results <- combined_data %>%
+  group_by(GeneSetLabel) %>%
+  filter(n_distinct(Group) == 2) %>%
+  filter(n() > 2) %>%
+  rstatix::wilcox_effsize(log2_Expression ~ Group, ci = TRUE, paired = FALSE, alternative = "two.sided")
+
+# ---- Summary Statistics Table ----
+summary_stats <- combined_data %>%
+  group_by(GeneSetLabel, Group) %>%
+  summarise(
+    N_Genes = n_distinct(Gene),
+    Median_VST = median(log2_Expression, na.rm = TRUE),
+    IQR_VST = IQR(log2_Expression, na.rm = TRUE),
+    Mean_VST = mean(log2_Expression, na.rm = TRUE),
+    SD_VST = sd(log2_Expression, na.rm = TRUE),
+    Min_VST = min(log2_Expression, na.rm = TRUE),
+    Max_VST = max(log2_Expression, na.rm = TRUE),
+    .groups = 'drop' # Drop grouping structure after summarising
+  ) %>%
+  # Arrange for readability
+  arrange(GeneSetLabel, Group)
+
+
+# ---- Plotting ----
+# Adjust y-axis expansion if needed, especially if target genes have very different expression
+# Calculate a potential new upper limit based on stat_test y.position
+# Ensure stat_test is not empty before calculating max_y
+max_y_stat <- if(nrow(stat_test) > 0) max(stat_test$y.position, na.rm = TRUE) else max(combined_data$log2_Expression, na.rm=TRUE)
+max_y_data <- max(combined_data$log2_Expression, na.rm = TRUE)
+# Add a buffer above the highest stat bracket or data point
+plot_upper_limit <- max(max_y_stat, max_y_data, na.rm = TRUE) * 1.05 # 10% buffer
+
+
+p_pub_combined_boxplot_stats_3groups <- ggplot(combined_data, aes(x = GeneSetLabel, y = log2_Expression, fill = Group)) +
+  geom_boxplot(
+    position = position_dodge(width = 0.8),
+    width = 0.6,
+    outlier.shape = 19,
+    outlier.size = 0.8,
+    outlier.alpha = 0.6,
+    alpha = 0.9,
+    linewidth = 0.5,
+    coef = 5 # Consider standard 1.5 if outliers look excessive, or keep 5 if intended
+  ) +
+
+  # Add significance brackets using ggpubr
+  # Check if stat_test has rows before trying to plot brackets
+  { if(nrow(stat_test) > 0)
+      ggpubr::stat_pvalue_manual(
+          stat_test,        # Use the adjusted stats table
+          label = "p.adj.signif", # Use the adjusted significance column
+          tip.length = 0.01,
+          hide.ns = TRUE,
+          inherit.aes = FALSE
+      )
+  } +
+
+  scale_fill_manual(
+    values = c(LR = "#1f77b4", ExoLR = "#ff7f0e"),
+    labels = c("LR", "ExoLR")
+  ) +
+
+  theme_bw(base_size = 11) + # Slightly smaller base size might help with 3 groups
+
+  labs(
+    x = "", # Keep x-axis label blank
+    y = expression(VST~Expression), # Or Log2 Expression if transformed
+    fill = NULL # Legend title for fill
+  ) +
+
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.5),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+    axis.title.y = element_text(size = rel(1.1), face = "bold"),
+    # Adjust x-axis text if labels overlap
+    axis.text.x = element_text(size = rel(0.95), color = "black", face = "bold", angle = 0, hjust = 0.5, vjust=0.5, lineheight = 1.1),
+    axis.text.y = element_text(size = rel(0.9), color = "black"),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    legend.position = "top",
+    legend.title = element_blank(),
+    legend.text = element_text(size = rel(1.0)),
+    legend.key.size = unit(1.0, "lines"),
+    legend.background = element_blank(),
+    legend.box.background = element_blank(),
+    plot.background = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = rel(1.3)),
+    plot.subtitle = element_text(hjust = 0.5, size = rel(1.1))
+  ) +
+
+  # Adjust y-axis expansion dynamically based on data and bracket positions
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1)), # Lower multiplier for top expansion initially
+                     limits = c(NA, plot_upper_limit)) # Set upper limit explicitly
+
+
+# Print the plot
+print(p_pub_combined_boxplot_stats_3groups)
+
+# Filter DESeq2 dataset to only include target genes
+dds_filtered <- dds[rownames(dds) %in% target_genes, ]
+dds_filtered <- DESeq(dds_filtered)
+
+# Print filtering information
+message(
+  "Removed ", nrow(normalized_counts) - nrow(normalized_counts[target_genes, ]),
+  " non-target genes. ",
+  "Retained ", length(target_genes), " target genes."
+)
+
+# convert data to something usable for bigpint
+data <- as.data.frame(assay(vst(dds, blind=FALSE)))
+data$ID <- rownames(data); rownames(data) <- NULL
+data <- data[, c(ncol(data), 1:(ncol(data)-1))]
+
+# scatterplot marked
+ret <- plotSM(data, geneList = non_target_genes, pointColor = "red",
+  pointSize = 0.5)
+ret[["ExoLR_LR"]] + ggtitle(paste0("non-targeted genes (n = ", length(non_target_genes), ")"))
+
+# convert data to something usable for bigpint
+data <- as.data.frame(assay(vst(dds_filtered, blind=FALSE)))
+data$ID <- rownames(data); rownames(data) <- NULL
+data <- data[, c(ncol(data), 1:(ncol(data)-1))]
+
+# scatterplot removed
+filtered_data <- data[!(data$ID %in% non_target_genes), ]
+ret <- plotSM(data=filtered_data, saveFile = FALSE)
+ret[["ExoLR_LR"]]
+
+```
+
+
+# remove all categories but protein coding
+```{r}
+
+# Get normalized counts and merge with gene information
+
+normalized_counts_targeted_wide <- as.data.frame(assay(vst(dds_filtered, blind=FALSE))) %>%
+  tibble::rownames_to_column("gene_name") %>%
+  left_join(
+    gene_info %>%
+      # Standardize pseudogene naming
+      mutate(gene_type = ifelse(grepl("pseudogene", gene_type, ignore.case = TRUE),
+                              "pseudogene",
+                              gene_type)),
+    by = "gene_name"
+  ) 
+  # --- remove antisense RNA ---
+  #filter(!(!endsWith(gene_name, "AS1") & gene_type == "lncRNA"))
+
+# Filter out unwanted gene types and report counts
+excluded_types <- c("miRNA", "snoRNA", "snRNA", "rRNA", "Mt_rRNA", "Mt_tRNA") 
+
+# Count and report excluded genes
+excluded_counts <- normalized_counts_targeted_wide %>%
+  filter(gene_type %in% excluded_types) %>%
+  count(gene_type, name = "count")
+
+if(nrow(excluded_counts) > 0) {
+  message("Excluded gene types:")
+  # Use walk2 from purrr (loaded with tidyverse)
+  purrr::walk2(excluded_counts$gene_type, excluded_counts$count,
+       ~ message(stringr::str_glue("- {.x}: {.y} genes")))
+} else {
+    message("No genes excluded based on specified types.")
+}
+
+# Prepare plotting data
+plot_data_targeted <- normalized_counts_targeted_wide %>%
+  filter(!gene_type %in% excluded_types) %>%
+  # Keep only necessary columns for pivoting and grouping before bind_rows
+  dplyr::select(gene_name, gene_type, matches("^(ExoLR|LR)")) %>%
+  # Create two versions: gene-specific and all genes
+  # Important: Do this *before* pivoting
+  bind_rows(mutate(., gene_type = "All Genes")) %>%
+  # Pivot longer first
+  pivot_longer(
+    cols = matches("^(ExoLR|LR)"), # Select only expression columns
+    names_to = "Sample",
+    values_to = "Expression" # This is VST expression
+  ) %>%
+  # Now process gene types and counts *after* pivoting and binding
+  mutate(
+    gene_type = case_when(
+      gene_type == "protein_coding" ~ "Protein Coding",
+      gene_type == "pseudogene" ~ "Pseudogene",
+      gene_type == "All Genes" ~ "All Genes",
+      gene_type == "lncRNA" ~ "lncRNA",
+      TRUE ~ gene_type # Keep other types as is, if any remain
+    ),
+     Group = factor(str_extract(Sample, "^ExoLR|^LR"),
+                   levels = c("LR", "ExoLR")),
+
+     log2_Expression = Expression
+   ) %>%
+  # Calculate gene counts per type *after* filtering and creating All Genes
+  group_by(gene_type) %>%
+  mutate(
+      # Use n_distinct on the original gene_name column
+      gene_count = n_distinct(gene_name),
+      # Ensure label uses the correct count for "All Genes" vs specific types
+      gene_type_label = paste0(gene_type, "\n(n=", gene_count, ")") # Add newline for x-axis
+      ) %>%
+  ungroup() %>%
+  # Set factor levels for plotting order
+  mutate(gene_type_label = factor(gene_type_label,
+                                 levels = c(
+                                    unique(gene_type_label[gene_type == "All Genes"]),
+                                    # Sort remaining levels alphabetically
+                                    sort(unique(gene_type_label[gene_type != "All Genes"]))
+                                    )
+                                  )
+         )
+
+# Check if plot_data_targeted is empty
+if(nrow(plot_data_targeted) == 0) {
+    stop("No data remaining after filtering and processing. Cannot proceed.")
+}
+
+
+# ---- 2. Statistical Analysis ----
+
+# Perform Wilcoxon test
+stat_test_targeted <- plot_data_targeted %>%
+  group_by(gene_type_label) %>%
+  filter(n_distinct(Group) == 2 & n() > 2) %>%
+  rstatix::wilcox_test(log2_Expression ~ Group, p.adjust.method = "none") %>%
+  ungroup() %>% # Ungroup before adjusting across all tests
+  rstatix::adjust_pvalue(method = "bonferroni") %>% # Adjust the 'p' column -> creates 'p.adj'
+  rstatix::add_significance(p.col = "p.adj") %>% # Add signif based on 'p.adj' -> creates 'p.adj.signif'
+  # Re-group needed ONLY IF add_xy_position relies on groups, let's assume it works post-ungroup
+  # If add_xy_position fails here, calculate it before ungrouping/adjusting.
+  rstatix::add_xy_position(x = "gene_type_label", dodge = 0.8)
+
+# Calculate effect size (rank biserial correlation)
+effect_size_targeted <- plot_data_targeted %>%
+  group_by(gene_type_label) %>%
+  filter(n_distinct(Group) == 2 & n() > 2) %>% # Robustness check
+  rstatix::wilcox_effsize(log2_Expression ~ Group, ci = TRUE, paired = FALSE)
+
+# ---- 3. Summary Statistics Table ----
+summary_stats_targeted <- plot_data_targeted %>%
+  group_by(gene_type_label, Group) %>%
+  summarise(
+    N_Genes = n_distinct(gene_name), # Count unique genes
+    Median_Expr = median(log2_Expression, na.rm = TRUE),
+    IQR_Expr = IQR(log2_Expression, na.rm = TRUE),
+    Mean_Expr = mean(log2_Expression, na.rm = TRUE),
+    SD_Expr = sd(log2_Expression, na.rm = TRUE),
+    .groups = 'drop' # Drop grouping
+  ) %>%
+  arrange(gene_type_label, Group) # Order for readability
+
+
+# ---- 4. Create Visualization with Stats ----
+
+# Define color palette (ensure order matches factor levels LR, ExoLR)
+gene_type_palette <- c("LR" = "#1f77b4", "ExoLR" = "#ff7f0e")
+
+# Calculate plot limits dynamically
+max_y_stat_targ <- if(nrow(stat_test_targeted) > 0) max(stat_test_targeted$y.position, na.rm = TRUE) else -Inf
+max_y_data_targ <- if(nrow(plot_data_targeted) > 0) max(plot_data_targeted$log2_Expression, na.rm = TRUE) else -Inf
+plot_upper_limit_targ <- if (is.finite(max_y_stat_targ) || is.finite(max_y_data_targ)) {
+                            max(max_y_stat_targ, max_y_data_targ, na.rm = TRUE) * 1.05 # 10% buffer
+                         } else {
+                            NA # Default if no valid data
+                         }
+
+p_pub_boxplot_targeted <- ggplot(plot_data_targeted, aes(x = gene_type_label, y = log2_Expression, fill = Group)) +
+  geom_boxplot(
+    position = position_dodge(width = 0.8),
+    width = 0.7,
+    outlier.shape = 19,
+    outlier.size = 0.8,
+    outlier.alpha = 0.6,
+    alpha = 0.9,
+    linewidth = 0.5,
+    coef = 5 # Wide outlier definition
+  ) +
+
+  # Add significance brackets conditionally
+  { if(nrow(stat_test_targeted) > 0)
+      ggpubr::stat_pvalue_manual(
+          stat_test_targeted,
+          label = "p.adj.signif", # Use adjusted p-value significance
+          tip.length = 0.01,
+          hide.ns = TRUE,
+          inherit.aes = FALSE
+      )
+  } +
+
+  scale_fill_manual(
+    values = gene_type_palette, # Use the named palette
+    labels = c("LR", "ExoLR")
+  ) +
+
+  theme_bw(base_size = 12) +
+
+  labs(
+    x = "",
+    # Update Y label based on whether you used VST directly or log2(VST+1)
+    y = expression(VST~Expression), # Or: expression(Log[2]~Expression~(VST~Counts))
+    fill = NULL
+  ) +
+
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.5),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+    axis.title.y = element_text(size = rel(1.1), face = "bold"),
+    # Rotate x-axis labels if they overlap
+    axis.text.x = element_text(size = rel(0.9), color = "black", face = "bold"),
+    axis.text.y = element_text(size = rel(0.9), color = "black"),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    legend.position = "top",
+    legend.title = element_blank(),
+    legend.text = element_text(size = rel(1.0)),
+    legend.key.size = unit(1.0, "lines"),
+    legend.background = element_blank(),
+    legend.box.background = element_blank(),
+    plot.background = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = rel(1.3)),
+    plot.subtitle = element_text(hjust = 0.5, size = rel(1.1)),
+    # Add some margin at the bottom if x-axis labels are rotated
+    plot.margin = margin(t = 5, r = 5, b = 15, l = 5, unit = "pt")
+  ) +
+
+  # Adjust y-axis limits and expansion
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1)),
+                     limits = c(NA, plot_upper_limit_targ))
+
+
+# Print the plot
+print(p_pub_boxplot_targeted)
+
+# Create a list containing character vectors of gene names for each gene type
+gene_type_lists <- split(normalized_counts_targeted_wide$gene_name, 
+                         normalized_counts_targeted_wide$gene_type)
+
+# Extract specific gene type vectors
+protein_coding_genes <- gene_type_lists[["protein_coding"]]
+lncRNA_genes <- gene_type_lists[["lncRNA"]]
+pseudogene_genes <- gene_type_lists[["pseudogene"]]
+
+# Filter dds to keep only protein coding genes
+dds_protein_coding <- dds_filtered[rownames(dds_filtered) %in% protein_coding_genes, ]
+dds_protein_coding <- DESeq(dds_protein_coding)
+
+# Verify the filtering
+message(
+  "Removed ", nrow(dds_filtered) - nrow(dds_protein_coding),
+  " non-protein-coding genes. ",
+  "Retained ", nrow(dds_protein_coding), " protein-coding genes."
+)
+
+# convert data to something usable for bigpint
+data <- as.data.frame(assay(vst(dds_filtered, blind=FALSE)))
+data$ID <- rownames(data); rownames(data) <- NULL
+data <- data[, c(ncol(data), 1:(ncol(data)-1))]
+
+# scatterplot protein coding
+ret <- plotSM(data, geneList = protein_coding_genes, pointColor = "red",
+  pointSize = 0.5, saveFile = FALSE)
+ret[["ExoLR_LR"]] + ggtitle(paste0("Protein Coding Genes (n = ", length(protein_coding_genes), ")"))
+
+# lncRNA
+ret <- plotSM(data, geneList = lncRNA_genes, pointColor = "red",
+  pointSize = 0.5, saveFile = FALSE)
+ret[["ExoLR_LR"]] + ggtitle(paste0("lncRNAs (n = ", length(lncRNA_genes), ")"))
+
+# pseudogenes
+ret <- plotSM(data, geneList = pseudogene_genes, pointColor = "red",
+  pointSize = 0.5, saveFile = FALSE)
+ret[["ExoLR_LR"]] + ggtitle(paste0("Pseudogenes (n = ", length(pseudogene_genes), ")"))
+
+# convert data to something usable for bigpint
+data <- as.data.frame(assay(vst(dds_protein_coding, blind=FALSE)))
+data$ID <- rownames(data); rownames(data) <- NULL
+data <- data[, c(ncol(data), 1:(ncol(data)-1))]
+
+# scatterplot removed
+filtered_data <- data[(data$ID %in% protein_coding_genes), ]
+ret <- plotSM(data=filtered_data, saveFile = FALSE)
+ret[["ExoLR_LR"]]
+
+# DEGs
+ret <- plotSM(data, geneList = sig_res$gene, pointColor = "red",
+  pointSize = 0.5, saveFile = FALSE)
+ret[["ExoLR_LR"]]
+
+# get results from dds
+res <- results(dds_protein_coding, name="enrichment_LR_vs_ExoLR")
+
+res_tbl <- res %>%
+        data.frame() %>%
+        rownames_to_column(var="gene") %>%
+        as_tibble()
+
+# make datametrics object
+metrics_df <- res_tbl %>%
+  rename(ID = gene,
+         logFC = log2FoldChange,
+         PValue = pvalue,
+         FDR = padj) %>%
+  dplyr::select(ID, logFC, PValue, FDR)
+
+# Now, create a list with three elements.
+dataMetrics <- list(
+  LR_ExoLR = metrics_df,
+  LR_SR    = metrics_df,
+  ExoLR_SR     = metrics_df
+)
+
+# Convert each element in dataMetrics to a data.frame
+dataMetrics <- lapply(dataMetrics, as.data.frame)
+
+# plotVolcano
+ret <- plotVolcano(data=filtered_data, dataMetrics = dataMetrics,
+    pointColor = "black", pointSize = 1, threshVar = "PValue",
+    threshVal = 1e-15, option = "allPoints", saveFile = FALSE)
+ret[["ExoLR_LR"]]
+
+# remove 0s 
+min_val <- min(dplyr::select(filtered_data, where(is.numeric)), na.rm = TRUE)
+filtered_data <- filtered_data %>%
+  filter(!if_any(where(is.numeric), ~ . == min_val)) 
+valid_ids <- filtered_data$ID
+dataMetrics <- lapply(dataMetrics, function(df) {
+  df[df$ID %in% valid_ids, ]
+})
+
+# plot
+ret <- plotSM(data=filtered_data, saveFile = FALSE)
+ret[["ExoLR_LR"]]
+
+# plotVolcano
+ret <- plotVolcano(data=filtered_data, dataMetrics = dataMetrics,
+    pointColor = "black", pointSize = 1, threshVar = "PValue",
+    threshVal = 0.05, option = "allPoints", saveFile = FALSE)
+ret[["ExoLR_LR"]]
+
+```
+
+
+# fit linear regression
+```{r}
+
+# 1. Filter columns and get names to compare
+data_filtered <- data[, !grepl("SR|ID", colnames(data))] # Remove SR and ID cols
+compare_cols <- colnames(data_filtered)
+
+# 2. Generate pairs and calculate R-squared and Correlation
+results <- combn(compare_cols, 2, FUN = function(pair) {
+  var1 <- pair[1]
+  var2 <- pair[2]
+
+  # Construct formula dynamically, using backticks for safety
+  formula <- reformulate(termlabels = paste0("`", var2, "`"),
+                         response   = paste0("`", var1, "`"))
+
+  # Fit model and extract R-squared
+  model_summary <- summary(lm(formula, data = data_filtered))
+  r_sq <- model_summary$r.squared
+
+  # Calculate Pearson correlation coefficient
+  # Need to access the columns directly from the data frame
+  correlation <- cor(data_filtered[[var1]], data_filtered[[var2]], method = "pearson")
+
+  # Return both values as a list
+  return(list(R_squared = r_sq, Correlation = correlation))
+
+}, simplify = FALSE) # Keep results as a list of lists initially
+
+# 3. Format results into a data frame
+results_df <- data.frame(
+  # Create comparison labels like "Var1 vs Var2"
+  Comparison = combn(compare_cols, 2, FUN = paste, collapse = " vs "),
+  # Extract R-squared values from the list of lists
+  R_squared = sapply(results, function(x) x$R_squared),
+  # Extract Correlation values from the list of lists
+  Correlation = sapply(results, function(x) x$Correlation)
+)
+
+# 4. Print the concise results
+print(results_df)
+
+```
+
+
+# dumbbel plots
+```{r}
+
+# antisense vs sense
+res <- results(dds_filtered, name="enrichment_LR_vs_ExoLR")
+
+res_tbl <- res %>%
+        data.frame() %>%
+        rownames_to_column(var="gene") %>%
+        as_tibble()
+
+res_tbl_lncRNA_only <- res_tbl %>%
+  filter(gene %in% lncRNA_genes)
+
+plot_data_paired <- res_tbl %>%
+  # 1. Create base gene name column
+  mutate(base_gene = sub("-AS1$", "", gene)) %>%
+  # 2. Create a type column (Base or AS1)
+  mutate(gene_type = ifelse(endsWith(gene, "-AS1"), "Antisense", "Sense")) %>%
+  # 3. Group by base_gene to ensure we have pairs
+  group_by(base_gene) %>%
+  # 4. Keep only groups with exactly two members (Base and AS1)
+  filter(n() == 2) %>%
+  # 5. Ungroup for plotting
+  ungroup() %>%
+  # Optional: Arrange by base_gene or L2FC for consistent plotting order
+  arrange(base_gene)
+
+# --- Create the dumbbell plot ---
+paired_l2fc_plot <- ggplot(plot_data_paired,
+                           aes(y = reorder(base_gene, log2FoldChange, median),
+                               x = log2FoldChange,
+                               color = gene_type)) +
+  # Draw the lines connecting the points for each pair
+  geom_line(aes(group = base_gene), color = "grey70", linewidth = 0.5) +
+  # Draw the points
+  geom_point(size = 2, alpha = 0.9) + # Added alpha for consistency
+  # Add a vertical line at L2FC=0
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", linewidth = 0.5) +
+
+  # --- STYLE MATCHING SECTION ---
+
+  # 1. Define specific colors (using a palette variable is good practice)
+  # scale_color_manual(values = gene_type_palette) # Use your palette
+  scale_color_manual(values = c("Sense" = "dodgerblue", "Antisense" = "firebrick")) +
+
+  # 2. Set base theme
+  theme_bw(base_size = 12) +
+
+  # 3. Apply detailed theme customizations from the boxplot
+  theme(
+    # Panel styling
+    panel.grid.major.y = element_blank(), # Hide horizontal grid lines
+    panel.grid.major.x = element_line(color = "grey90", linewidth = 0.5), # Style vertical grid lines
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+
+    # Axis styling
+    axis.title.x = element_text(size = rel(1.1)),
+    axis.text.x = element_text(size = rel(0.9), color = "black"),
+    axis.ticks.x = element_line(color = "black", linewidth = 0.5),
+
+    # Hide the Y-axis completely (as requested previously)
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+
+    # Legend styling
+    legend.position = "top",
+    legend.title = element_blank(), # Hides the legend title
+    legend.text = element_text(size = rel(1.0)),
+    legend.key.size = unit(1.0, "lines"),
+    legend.background = element_blank(),
+    legend.box.background = element_blank(),
+
+    # Plot styling
+    plot.background = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = rel(1.3)),
+    plot.subtitle = element_text(hjust = 0.5, size = rel(1.1)),
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 5, unit = "pt") # Adjusted bottom margin
+  ) +
+
+  # 4. Labels and Title
+  labs(
+    title = "", # Add your title here if needed
+    subtitle = "", # Add your subtitle here if needed
+    x = "logFC", # Using expression for formatting
+    y = "Genes", # Set to NULL as the axis is hidden
+    color = NULL # Set to NULL to match legend.title = element_blank()
+  ) +
+
+  # 5. Axis Expansion (optional, but good for consistency)
+  # This adds a little space so points aren't cut off at the edges
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.05)))
+
+# --- Show the plot ---
+print(paired_l2fc_plot)
+
+# Pre-calculate target gene prefixes for efficiency
+target_prefixes <- substring(target_genes, 1, 3)
+
+# Use lapply to iterate through pseudogenes and find matches
+matches_list <- lapply(pseudogene_genes, function(pseudo_gene) {
+  # Get the 3-character prefix for the current pseudogene
+  pseudo_prefix <- substring(pseudo_gene, 1, 3)
+
+  # Find indices of target genes with matching prefix
+  matching_indices <- which(target_prefixes == pseudo_prefix)
+
+  # If matches are found, create a data frame row(s) for them
+  if (length(matching_indices) > 0) {
+    # Retrieve the full names of the matching target genes
+    potential_parents <- target_genes[matching_indices]
+    # Return a data frame linking the pseudogene to its potential parent(s)
+    return(data.frame(
+      Pseudogene = pseudo_gene,
+      PotentialParent = potential_parents,
+      stringsAsFactors = FALSE # Good practice
+    ))
+  } else {
+    # If no match, return NULL (it will be filtered out later)
+    return(NULL)
+  }
+})
+
+# Combine the list of data frames (results for each pseudogene) into one large data frame
+# Filter(Negate(is.null), ...) removes the NULL entries where no match was found
+potential_matches_df <- do.call(rbind, Filter(Negate(is.null), matches_list))
+
+# --- Display Results ---
+
+if (nrow(potential_matches_df) > 0) {
+  print("Potential Pseudogene-Parent Matches (based on first 3 characters):")
+  print(potential_matches_df, row.names = FALSE)
+} else {
+  print("No potential matches found based on the first 3 characters.")
+}
+
+# Get unique pseudogenes to process
+unique_pseudogenes <- unique(potential_matches_df$Pseudogene)
+
+# List to store the final best matches
+best_matches_list <- list()
+
+# Loop through each unique pseudogene
+for (current_pseudo in unique_pseudogenes) {
+
+  # 1. Get potential parents for this pseudogene from the initial matches
+  parents_for_current <- potential_matches_df$PotentialParent[potential_matches_df$Pseudogene == current_pseudo]
+
+  # 2. Remove potential parents that are exactly the same as the pseudogene
+  parents_filtered <- parents_for_current[parents_for_current != current_pseudo]
+
+  # If no potential parents remain after filtering, skip to the next pseudogene
+  if (length(parents_filtered) == 0) {
+    next
+  }
+
+  # 3. Iterative shortening and matching
+  found_match <- FALSE
+  best_match_parent <- NA
+  shortened_pseudo <- current_pseudo # Start with the full name
+
+  # Loop while the shortened name has characters and we haven't found a match
+  while (nchar(shortened_pseudo) > 0 && !found_match) {
+
+    # Check if the *current* shortened name exactly matches any *filtered* potential parent
+    if (shortened_pseudo %in% parents_filtered) {
+      # Match found! Store it and stop shortening for this pseudogene
+      best_match_parent <- shortened_pseudo
+      found_match <- TRUE
+      # Keep track of which pseudogene this match belongs to
+      best_matches_list[[current_pseudo]] <- data.frame(
+        Pseudogene = current_pseudo,
+        BestMatchParent = best_match_parent,
+        stringsAsFactors = FALSE
+      )
+    } else {
+      # No match yet, remove the last character and continue the loop
+      shortened_pseudo <- substring(shortened_pseudo, 1, nchar(shortened_pseudo) - 1)
+    }
+  }
+  # End of while loop for the current pseudogene
+} # End of for loop over unique pseudogenes
+
+# Combine the results from the list into a final data frame
+if (length(best_matches_list) > 0) {
+  final_best_matches_df <- do.call(rbind, best_matches_list)
+  print("Refined Pseudogene-Parent Matches:")
+  print(final_best_matches_df, row.names = FALSE)
+} else {
+  print("No refined matches found after filtering and iterative shortening.")
+}
+
+res <- results(dds_filtered, name="enrichment_LR_vs_ExoLR")
+
+res_tbl <- res %>%
+        data.frame() %>%
+        rownames_to_column(var="gene") %>%
+        as_tibble()
+
+res_tbl_pseudogenes_only <- res_tbl %>%
+  dplyr::filter(gene %in% pseudogene_genes)
+
+
+# 1. Select L2FC for pseudogenes
+pseudo_l2fc <- res_tbl_pseudogenes_only %>%
+  dplyr::select(Pseudogene = gene, L2FC_Pseudo = log2FoldChange)
+
+# 2. Select L2FC for parent genes (from the *full* results table)
+# Ensure the 'BestMatchParent' genes exist in your full results table
+parent_l2fc <- res_tbl %>%
+  filter(gene %in% final_best_matches_df$BestMatchParent) %>%
+  dplyr::select(BestMatchParent = gene, L2FC_Parent = log2FoldChange)
+
+# 3. Merge the data together
+# Start with the mapping, add pseudogene L2FC, then add parent L2FC
+plot_data_wide <- final_best_matches_df %>%
+  inner_join(pseudo_l2fc, by = "Pseudogene") %>%
+  inner_join(parent_l2fc, by = "BestMatchParent") %>%
+  # Calculate difference for ordering later
+  mutate(diff_l2fc = L2FC_Pseudo - L2FC_Parent) %>%
+  # Ensure there are no NA values in fold changes for plotting
+  filter(!is.na(L2FC_Pseudo) & !is.na(L2FC_Parent))
+
+# Check if data exists after merging
+if(nrow(plot_data_wide) == 0) {
+  stop("No matching data found after merging pseudogene info, parent info, and L2FC values. Check gene names and input tables.")
+}
+
+# 4. Reshape data to long format for easier ggplot color mapping
+plot_data_long <- plot_data_wide %>%
+  pivot_longer(cols = c(L2FC_Pseudo, L2FC_Parent),
+               names_to = "GeneType",
+               values_to = "L2FC",
+               names_prefix = "L2FC_") # Removes "L2FC_" prefix
+
+# Optional: Make GeneType names nicer
+plot_data_long <- plot_data_long %>%
+  mutate(GeneType = factor(GeneType, levels = c("Parent", "Pseudo"))) # Control order
+
+# Your colors and data remain the same
+my_colors <- c("Parent" = "dodgerblue", "Pseudo" = "firebrick")
+
+# --- Create the Perfectly Styled Dumbbell Plot ---
+dumbbell_plot_final <- ggplot(plot_data_long, aes(x = L2FC, y = reorder(Pseudogene, diff_l2fc))) +
+  # --- Geom layers with perfectly matched styling ---
+  geom_line(aes(group = Pseudogene), color = "grey70", linewidth = 0.5) +
+  geom_point(aes(color = GeneType), size = 2, alpha = 0.9) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", linewidth = 0.5) +
+
+  # --- Scales matched from reference ---
+  scale_color_manual(values = my_colors) +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.05))) +
+
+  # --- Labs with styled titles and formatted labels ---
+  labs(
+    title = "",
+    subtitle = "",
+    x = "logFC",
+    y = "Genes", # This title will be visible
+    color = NULL     # Hides legend title via labs
+  ) +
+
+  # --- Base theme and detailed theme customizations from the reference plot ---
+  theme_bw(base_size = 12) +
+  theme(
+    # Panel styling
+    panel.grid.major.x = element_line(color = "grey90", linewidth = 0.5),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+
+    # X-Axis styling (copied directly from reference)
+    axis.title.x = element_text(size = rel(1.1)),
+    axis.text.x = element_text(size = rel(0.9), color = "black"),
+    axis.ticks.x = element_line(color = "black", linewidth = 0.5),
+
+    # Y-Axis styling (to meet your specific requirement)
+    axis.title.y = element_text(size = rel(1.1)), # Keep and style the title
+    axis.text.y = element_blank(),  # Hide the labels (gene names)
+    axis.ticks.y = element_blank(),  # Hide the ticks
+
+    # Legend styling (copied directly from reference)
+    legend.position = "top",
+    legend.title = element_blank(),
+    legend.text = element_text(size = rel(1.0)),
+    legend.key.size = unit(1.0, "lines"),
+    legend.background = element_blank(),
+    legend.box.background = element_blank(),
+
+    # Plot styling (copied directly from reference)
+    plot.background = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = rel(1.3)),
+    plot.subtitle = element_text(hjust = 0.5, size = rel(1.1)),
+    plot.caption = element_text(hjust = 1, size = rel(0.8), color = "grey30"),
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 5, unit = "pt")
+  )
+
+# --- Print the final, correctly styled plot ---
+print(dumbbell_plot_final)
+
+```
+
+
+# gene features
+```{r}
+
+# --- 1. Data Preparation ---
+# (Keep code from previous step)
+normalized_counts_protein_coding <- assay(vst(dds_protein_coding, blind = FALSE)) %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_name") %>%
+  left_join(gene_info, by = "gene_name") %>%
+  left_join(
+    res_tbl %>% dplyr::select(gene, log2FoldChange, padj),
+    by = c("gene_name" = "gene")
+  ) %>%
+  mutate(
+    DEG = case_when(
+      is.na(padj) ~ "Non-DE Genes",
+      padj > 0.05 ~ "Non-DE Genes",
+      padj <= 0.05 & log2FoldChange > 0 ~ "LR +",
+      padj <= 0.05 & log2FoldChange < 0 ~ "ExoLR +"
+    ),
+    DEG = factor(DEG, levels = c("LR +", "ExoLR +", "Non-DE Genes"))
+  )
+
+# --- 2. Prepare Data for Plotting ---
+# (Keep code from previous step)
+feature_cols <- c(
+  "exon_content", "GC_content", "gene_width", "width", "Transcript.count",
+  "identity_bcM0002", "identity_bcM0004"
+)
+feature_levels_ordered <- c(
+  "Exon Ratio", "GC Ratio", "Log2(Gene Length)",
+  "Log2(Total Exon Length)", "Transcripts", "Identity"
+)
+plot_data <- normalized_counts_protein_coding %>%
+  dplyr::select(gene_name, DEG, all_of(feature_cols)) %>%
+  filter(!is.na(DEG)) %>%
+  pivot_longer(
+    cols = all_of(feature_cols), names_to = "raw_feature", values_to = "value"
+  ) %>%
+  mutate(
+    value = case_when(
+      raw_feature %in% c("gene_width", "width") ~ log2(value),
+      TRUE ~ value
+    ),
+    feature = factor(
+      case_when(
+        grepl("^identity_", raw_feature) ~ "Identity",
+        raw_feature == "exon_content" ~ "Exon Ratio",
+        raw_feature == "GC_content" ~ "GC Ratio",
+        raw_feature == "gene_width" ~ "Log2(Gene Length)",
+        raw_feature == "width" ~ "Log2(Total Exon Length)",
+        raw_feature == "Transcript.count" ~ "Transcripts",
+        TRUE ~ NA_character_
+      ),
+      levels = feature_levels_ordered
+    )
+  ) %>%
+  filter(!is.na(feature)) %>%
+  mutate(DEG = factor(DEG, levels = levels(normalized_counts_protein_coding$DEG)))
+
+# --- 3. Create Legend Labels ---
+# (Keep code from previous step)
+deg_counts <- plot_data %>%
+  group_by(DEG) %>%
+  summarise(n = n_distinct(gene_name), .groups = 'drop') %>%
+  mutate(legend_label = paste0(DEG, " (n=", n, ")"))
+legend_labels <- setNames(deg_counts$legend_label, deg_counts$DEG)
+legend_labels <- legend_labels[levels(plot_data$DEG)]
+
+# --- 4. Statistical Analysis  ---
+
+# Calculate base stats and initial positions
+stat_test_base <- plot_data %>%
+  group_by(feature) %>%
+  filter(n_distinct(DEG) > 1 & n() > 2) %>%
+  rstatix::wilcox_test(value ~ DEG, p.adjust.method = "bonferroni") %>%
+  rstatix::add_significance(p.col = "p.adj") %>%
+  rstatix::add_xy_position(x = "DEG") # Get xmin, xmax, group1, group2
+
+# Calculate max value and data range per facet *from the plot data*
+facet_summary <- plot_data %>%
+    group_by(feature) %>%
+    summarise(
+        max_value_in_facet = max(value, na.rm = TRUE),
+        min_value_in_facet = min(value, na.rm = TRUE),
+        data_range_facet = max_value_in_facet - min_value_in_facet,
+        .groups = 'drop'
+        )
+
+# Join summary stats back and calculate adaptive y-positions
+# --- **ADJUST THESE PARAMETERS AS NEEDED** ---
+relative_step_size <- 0.1 # Relative height of step between brackets (fraction of data range)
+absolute_min_step_size <- 0.001 # Minimum absolute step size if range is tiny (adjust based on typical scales)
+base_offset_factor <- 1.001 # Place the lowest bracket this factor * max_value above the highest data point
+# --- End of Parameters ---
+
+stat_test_facet_adjusted <- stat_test_base %>%
+    left_join(facet_summary, by = "feature") %>%
+    # Ensure calculations are robust to zero range
+    mutate(
+        step_size = pmax(data_range_facet * relative_step_size, absolute_min_step_size, na.rm = TRUE)
+        ) %>%
+    # Arrange comparisons within each facet to define stacking order
+    # (Order by xmin ensures comparisons starting more left are potentially lower)
+    group_by(feature) %>%
+    arrange(xmin, xmax) %>%
+    mutate(bracket_rank = row_number()) %>% # Assign rank within the facet
+    # Calculate the final y.position
+    mutate(
+        y.position = (max_value_in_facet * base_offset_factor) + (bracket_rank - 1) * step_size
+        ) %>%
+    ungroup()
+
+
+# Calculate effect size (no change needed here)
+effect_size_facet <- plot_data %>%
+  group_by(feature) %>%
+  filter(n_distinct(DEG) > 1 & n() > 2) %>%
+  rstatix::wilcox_effsize(value ~ DEG, ci = TRUE, paired = FALSE)
+
+# --- Calculate stats for NON-log features from plot_data ---
+summary_stats_non_log <- plot_data %>%
+  filter(!feature %in% c("Log2(Gene Length)", "Log2(Total Exon Length)")) %>%
+  group_by(feature, DEG) %>%
+  summarise(
+    N_Genes = n_distinct(gene_name),
+    Median_Value = median(value, na.rm = TRUE),
+    IQR_Value = IQR(value, na.rm = TRUE),
+    Mean_Value = mean(value, na.rm = TRUE),
+    SD_Value = sd(value, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# --- Calculate stats for log features using ORIGINAL data ---
+# Go back to the data before pivoting and log transforming
+summary_stats_log_orig_scale <- normalized_counts_protein_coding %>%
+  filter(!is.na(DEG)) %>% # Ensure DEG assignment exists
+  # Select original length columns and grouping variable
+  dplyr::select(DEG, gene_name, gene_width, width) %>%
+  # Pivot longer to match the structure needed for combining
+  pivot_longer(
+      cols = c(gene_width, width),
+      names_to = "raw_feature",
+      values_to = "original_value"
+      ) %>%
+  # Map raw feature name to the desired final feature name
+   mutate(
+    feature = factor(case_when(
+        raw_feature == "gene_width" ~ "Gene Length",
+        raw_feature == "width" ~ "Total Exon Length",
+        TRUE ~ NA_character_ # Should not happen
+      ),
+      # Ensure levels match the desired final order
+      levels = c("Exon Ratio", "GC Ratio", "Gene Length", # Use non-log names
+                 "Total Exon Length", "Transcripts", "Identity")
+    )
+   ) %>%
+  filter(!is.na(feature)) %>% # Remove any potential NA features
+  # Now calculate summaries on the original_value
+  group_by(feature, DEG) %>%
+  summarise(
+    N_Genes = n_distinct(gene_name),
+    Median_Value = median(original_value, na.rm = TRUE),
+    IQR_Value = IQR(original_value, na.rm = TRUE),
+    Mean_Value = mean(original_value, na.rm = TRUE),
+    SD_Value = sd(original_value, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# --- Combine the two summary tables ---
+summary_stats_facet_combined <- bind_rows(
+    summary_stats_non_log,
+    summary_stats_log_orig_scale
+  ) %>%
+  # Ensure final ordering
+  arrange(feature, DEG)
+
+# --- 5. Create the Plot with Adjusted Stats ---
+
+# Define colors (ensure order matches factor levels)
+color_map <- c(
+  "ExoLR +" = "#ff7f0e",
+  "LR +" = "#1f77b4",
+  "Non-DE Genes" = "gray70"
+)
+color_map <- color_map[levels(plot_data$DEG)]
+
+p_pub_boxplot_facet <- ggplot(plot_data, aes(x = DEG, y = value, fill = DEG)) +
+  geom_boxplot(
+    width = 0.7, alpha = 0.8, outlier.shape = 19,
+    outlier.size = 1.0, outlier.alpha = 0.5, linewidth = 0.5, coef = 5
+  ) +
+  facet_wrap(~ feature, scales = "free_y", ncol = 3) +
+
+  # Use the NEW adjusted stats table
+  { if(nrow(stat_test_facet_adjusted) > 0)
+      ggpubr::stat_pvalue_manual(
+          stat_test_facet_adjusted, # <-- Use the adjusted table
+          label = "p.adj.signif",
+          tip.length = 0.01,
+          hide.ns = TRUE,
+          inherit.aes = FALSE
+          # REMOVE step.increase - we now control spacing via y.position calculation
+      )
+  } +
+
+  theme_bw(base_size = 10) +
+  labs(x = NULL, y = NULL, fill = NULL) +
+  scale_fill_manual(values = color_map, labels = legend_labels) +
+  theme(
+    # (Keep your previous theme settings)
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.5),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+    strip.text = element_text(size = rel(1.1), face = "bold", margin = margin(t = 5, b = 5)),
+    strip.background = element_rect(fill = "grey95", color = NA),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_text(size = rel(0.9), color = "black"),
+    axis.ticks.y = element_line(color = "black", linewidth = 0.5),
+    axis.title.y = element_text(size=rel(1.1), face = "bold"),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = rel(0.9)),
+    legend.key.size = unit(0.8, "lines"),
+    panel.spacing = unit(1, "lines"),
+    plot.background = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = rel(1.3))
+  ) +
+  # Adjust y-axis limits - ensure enough space for potentially higher brackets
+  # The auto-expansion might be sufficient now, but manual adjustment might still be needed
+   scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) # Increased upper expansion MORE
+
+# Print the plot
+print(p_pub_boxplot_facet)
+
+```
+
+
+# What are the most significant genes
+```{r}
+
+# how many non-zero DEGs 
+# Function to print counts nicely
+print_deg_counts <- function(df, title) {
+  cat(paste("--- ", title, " ---\n"))
+  if (nrow(df) == 0) {
+    cat("No data to count.\n\n")
+    return()
+  }
+  if (!"DEG" %in% colnames(df)) {
+      cat("Error: 'DEG' column not found.\n\n")
+      return()
+  }
+
+  counts <- df %>%
+    count(DEG, name = "RowCount") # Use 'name' argument for clarity
+
+  if (nrow(counts) > 0) {
+    # Use apply to iterate and print nicely
+    apply(counts, 1, function(row) {
+      cat(sprintf("Category '%s': %d rows\n", row["DEG"], as.numeric(row["RowCount"])))
+    })
+  } else {
+    cat("No rows found with DEG categories in this dataset.\n")
+  }
+  cat("\n") # Add a newline for separation
+}
+
+# 1. Print counts BEFORE filtering
+print_deg_counts(normalized_counts_protein_coding, "DEG Counts Before Filtering")
+
+# 2. Filter the data frame
+filtered_data <- normalized_counts_protein_coding
+
+# 3. Print counts AFTER filtering
+print_deg_counts(filtered_data, "DEG Counts After Filtering (Using valid_ids)")
+
+# Optional: Show how many rows were kept/removed
+cat(sprintf("--- Filtering Summary ---\n"))
+cat(sprintf("Original rows: %d\n", nrow(normalized_counts_protein_coding)))
+cat(sprintf("Rows after filtering: %d\n", nrow(filtered_data)))
+cat(sprintf("Rows removed: %d\n", nrow(normalized_counts_protein_coding) - nrow(filtered_data)))
+cat("\n")
+cat("--- Analysis of Top 10 Genes with Lowest padj in Filtered Data ---\n\n")
+
+# 1. Find the top 10 genes with the lowest padj
+# Ensure padj is numeric and handle potential NAs if they exist
+top_10_genes <- filtered_data %>%
+  filter(!is.na(padj)) %>% # Remove rows where padj is NA, if any
+  arrange(padj) %>%
+  slice_head(n = 10)
+
+# Check if we actually got 10 (or fewer if the filtered set was small)
+num_top_genes <- nrow(top_10_genes)
+cat(sprintf("Identified the top %d genes with the lowest adjusted p-values (padj):\n", num_top_genes))
+
+# 2. Describe the DEG category of these top 10 genes
+cat(sprintf("--- DEG Categories for the Top %d Genes ---\n", num_top_genes))
+deg_counts_top10 <- top_10_genes %>%
+  count(DEG, name = "Count")
+
+if (nrow(deg_counts_top10) > 0) {
+  apply(deg_counts_top10, 1, function(row) {
+    cat(sprintf("Category '%s': %d genes\n", row["DEG"], as.numeric(row["Count"])))
+  })
+  # Provide a summary statement
+  if (nrow(deg_counts_top10) == 1) {
+     cat(sprintf("All top %d genes belong to the '%s' category.\n", num_top_genes, deg_counts_top10$DEG[1]))
+  } else {
+     cat(sprintf("The top %d genes are distributed across multiple DEG categories as listed above.\n", num_top_genes))
+  }
+} else {
+  cat("Could not determine DEG categories for the top genes (perhaps DEG column was empty or NA).\n")
+}
+cat("\n")
+
+
+# 3. Compare numerical columns to the rest of the filtered data
+cat(sprintf("--- Comparison of Characteristics (Top %d vs. All %d Filtered Genes) ---\n",
+            num_top_genes, nrow(filtered_data)))
+
+# Define the columns to compare
+columns_to_compare <- c("width", "gene_width", "exon_content", "GC_content",
+                        "Transcript.count", "identity_bcM0002", "identity_bcM0004")
+
+# Calculate summary statistics (mean and median) for the top 10
+summary_top10 <- top_10_genes %>%
+  summarise(across(all_of(columns_to_compare),
+                   list(mean = ~mean(.x, na.rm = TRUE),
+                        median = ~median(.x, na.rm = TRUE)),
+                   .names = "{.col}_{.fn}")) # Create names like width_mean, width_median
+
+# Calculate summary statistics for ALL filtered data
+summary_all_filtered <- filtered_data %>%
+  summarise(across(all_of(columns_to_compare),
+                   list(mean = ~mean(.x, na.rm = TRUE),
+                        median = ~median(.x, na.rm = TRUE)),
+                  .names = "{.col}_{.fn}"))
+
+# Function to compare and print
+compare_and_print <- function(col_name, stat_type = "mean") {
+  top10_val_col <- paste0(col_name, "_", stat_type)
+  all_val_col <- paste0(col_name, "_", stat_type)
+
+  top10_val <- summary_top10[[top10_val_col]]
+  all_val <- summary_all_filtered[[all_val_col]]
+
+  if (is.na(top10_val) || is.na(all_val)) {
+    cat(sprintf("  - %s (%s): Cannot compare due to NA values.\n", col_name, stat_type))
+    return()
+  }
+
+  comparison <- ifelse(top10_val > all_val, "higher",
+                       ifelse(top10_val < all_val, "lower", "similar"))
+
+  cat(sprintf("  - %s (%s): Top %d %s (%.3f) is %s than the overall filtered %s (%.3f).\n",
+              col_name, stat_type, num_top_genes, stat_type, top10_val,
+              comparison, stat_type, all_val))
+}
+
+# Loop through the columns and print comparisons for both mean and median
+for (col in columns_to_compare) {
+  cat(sprintf("Comparing '%s':\n", col))
+  compare_and_print(col, "mean")
+  compare_and_print(col, "median")
+  cat("\n") # Add space between column comparisons
+}
+
+cat("--- End of Analysis ---\n")
+
+```
+
+
+# scatterplots and Random Forest
+```{r}
+library(parallel)
+library(foreach)
+library(doParallel)
+library(caret)
+
+# set up data
+df <- res_tbl %>%
+  left_join(gene_info, by = c("gene" = "gene_name")) %>%
+  filter(gene %in% rownames(dds_protein_coding)) %>%
+  dplyr::select(log2FoldChange, exon_content, GC_content, gene_width, width, Transcript.count, identity_bcM0002, identity_bcM0004) %>%
+  # Replace NAs in identity columns with 1.0 BEFORE omitting other NAs
+  mutate(across(c(identity_bcM0002, identity_bcM0004), ~ coalesce(., 1.0))) %>%
+  # Now omit rows with NAs in any of the *other* selected columns
+  na.omit()
+
+# Set up parallel processing (using all but one core)
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Set up train control with 10-fold CV and verbose iteration for progress
+train_control <- trainControl(method = "cv", number = 10, verboseIter = TRUE)
+
+# Train the Random Forest model using 'ranger' method
+rf_model <- train(log2FoldChange ~ .,
+                  data = df,
+                  method = "ranger",
+                  trControl = train_control,
+                  importance = 'impurity',  # optional: to compute feature importance
+                  verbose = TRUE)
+
+# Print the model details
+print(rf_model)
+
+# Stop the parallel cluster when finished
+stopCluster(cl)
+
+# Get variable importance from the model
+importance <- varImp(rf_model)
+print(importance)
+
+# Perform the left join (ensure necessary columns are present)
+# Make sure gene_info contains the identity columns AFTER processing them (e.g., division by 100)
+DE_df <- res_tbl %>%
+  left_join(gene_info, by = c("gene" = "gene_name")) %>%
+  filter(gene %in% rownames(dds_protein_coding)) %>%
+  # Optional but recommended: Filter NAs that would be removed by ggplot anyway
+  filter(!is.na(log2FoldChange))
+
+# Define the features to plot
+# Ensure these columns exist in DE_df after the join!
+feat <- c("exon_content", "GC_content", "gene_width", "width", "Transcript.count","identity_bcM0002", "identity_bcM0004")
+
+# Check if all features exist in DE_df
+missing_feats <- setdiff(feat, colnames(DE_df))
+if (length(missing_feats) > 0) {
+  stop("The following features are missing from DE_df: ", paste(missing_feats, collapse=", "))
+}
+
+
+# --- Reshape data using pivot_longer and create the unified 'Feature' column ---
+DE_df_long <- DE_df %>%
+  dplyr::select(gene, log2FoldChange, all_of(feat)) %>% # Keep gene ID if needed, select relevant cols
+  pivot_longer(
+    cols = all_of(feat),
+    names_to = "raw_feature", # Store the original column name temporarily
+    values_to = "Value"
+  ) %>%
+  # Remove rows where the feature value is NA (can cause issues with plotting/stats)
+  filter(!is.na(Value)) %>%
+  mutate(
+    Value = case_when(
+      # If the original feature was width or gene_width, divide Value by 1000
+      raw_feature %in% c("width", "gene_width") ~ Value / 1000,
+      # Otherwise, keep the Value as it is
+      TRUE ~ as.numeric(Value) # Ensure Value remains numeric type
+    )
+  ) %>%  
+  # Create the final 'Feature' column for faceting
+  mutate(
+    Feature = case_when(
+      raw_feature == "width" ~ "Total Exon Length (KB)",
+      raw_feature == "gene_width" ~ "Gene Length (KB)",
+      raw_feature == "exon_content" ~ "Exon Ratio",
+      raw_feature == "GC_content" ~ "GC Ratio",
+      raw_feature == "Transcript.count" ~ "Transcripts",
+      # Map *both* identity columns to the same label
+      raw_feature %in% c("identity_bcM0002", "identity_bcM0004") ~ "Identity",
+      TRUE ~ raw_feature # Fallback (shouldn't be needed if 'feat' is correct)
+    )
+  )
+
+# --- Define the desired order for facets ---
+feature_order <- c(
+  "Exon Ratio",
+  "GC Ratio",
+  "Gene Length (KB)",
+  "Total Exon Length (KB)",
+  "Transcripts",
+  "Identity"
+)
+
+# Convert the new Feature column to a factor with the specified order
+DE_df_long <- DE_df_long %>%
+  mutate(Feature = factor(Feature, levels = feature_order))
+
+# Create the plot
+p_pub_aesthetic <- ggplot(DE_df_long, aes(x = Value, y = log2FoldChange)) +
+
+  # Add horizontal line at y=0 for reference - essential for fold change plots
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey30", linewidth = 0.5) +
+
+  # Points: Slightly smaller size might look cleaner, depends on density
+  geom_point(alpha = 0.4, size = 1.2) + # Adjusted size slightly, revert to 1.5 if preferred
+
+  # Facet by Feature
+  facet_wrap(~ Feature, scales = "free_x") + # Consider adding ncol = ? if you have many facets
+
+  # Use a clean theme often preferred for publications
+  theme_bw(base_size = 10) + # theme_bw or theme_classic are common; adjusted base_size
+
+  labs(
+    x = "", # Keep blank as it varies per facet
+    y = "logFC" # Use expression for proper math formatting
+  ) +
+
+  # Theme Customizations for Publication Quality
+  theme(
+    # Panel Appearance
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.5), # Lighter major grid lines
+    panel.grid.minor = element_blank(), # Remove minor grid lines (already done in original)
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7), # Ensure border is visible
+
+    # Facet Label Appearance
+    strip.text = element_text(size = rel(1.0), face = "bold", margin = margin(t = 4, b = 4)), # Adjust spacing if needed
+    strip.background = element_rect(fill = "grey95", color = NA), # Subtle background for facet titles
+
+    # Axis Appearance
+    axis.title.y = element_text(size = rel(1.1), face = "bold"), # Keep y-axis title slightly larger/bold
+    axis.text = element_text(size = rel(0.9), color = "black"), # Ensure axis text is black and readable size
+    axis.ticks = element_line(color = "black", linewidth = 0.5), # Make ticks visible
+
+    # General plot appearance
+    plot.background = element_blank() # Remove grey background around the plot if present
+  )
+
+# Print the plot
+print(p_pub_aesthetic)
+
+```
+
+

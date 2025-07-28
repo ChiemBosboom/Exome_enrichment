@@ -1,0 +1,1137 @@
+---
+title: "FLAIR"
+output: html_document
+date: "2025-05-12"
+---
+
+# flair correct
+```{bash}
+
+# get FLAIR
+git clone https://github.com/BrooksLabUCSC/flair.git
+cd flair
+git checkout v2.1.0
+conda env create -n flair -f misc/flair_conda_env.yaml
+conda activate flair
+pip install .
+
+# variables
+ref=${wrk}/data_analysis/consensus/human_GRCh38_no_alt_analysis_set.fasta
+samples=(bcM0001 bcM0002 bcM0004)
+enrichment=exome_enriched # and no_enrichment
+req=/hpc/hers_en/cvandijk/longRead_singleNucleus/pipeline/requiredFiles/
+refGTF=$req/gencode.v46.annotation.sorted.gtf
+
+# no secondary alignment
+for sample in ${samples[@]}
+  do
+echo -e "\
+#!/bin/bash  
+minimap2 -ax splice:hq -t 4 -uf --secondary=no --junc-bed reference/gencode.v46.annotation.sorted.bed \
+    ${req}/human_GRCh38_no_alt_analysis_set.mmi \
+    data_analysis/${enrichment}/isoseq_groupdedup_deduplication/${sample}_modified.fasta | \
+samtools view -@ 4 -bS - | \
+samtools sort -@ 4 -o data_analysis/${enrichment}/minimap2_alignment/${sample}_no_sec_align_dedup.bam - " | sbatch --time 24:00:00 --mem 64G --cpus-per-task 4 --job-name mm2.${sample}.${enrichment} -o data_analysis/${enrichment}/minimap2_alignment/${sample}.log -e data_analysis/${enrichment}/minimap2_alignment/${sample}.log 
+  done
+
+# convert aligned bam files to bed
+for sample in "${samples[@]}"; do
+  echo -e "\
+#!/bin/bash
+bam2Bed12 -i data_analysis/${enrichment}/minimap2_alignment/${sample}_no_sec_align_dedup.bam > data_analysis/${enrichment}/minimap2_alignment/${sample}_no_sec_align_dedup.bed" | sbatch --time=1:00:00 --mem=8G --job-name=${enrichment}.${sample}.bed -o /dev/null -e /dev/null
+done
+
+# run correct
+for sample in "${samples[@]}"; do
+  echo -e "\
+#!/bin/bash
+flair correct -q data_analysis/${enrichment}/minimap2_alignment/${sample}_no_sec_align_dedup.bed -f $refGTF -g $ref --output data_analysis/FLAIR/correct/${enrichment}.${sample} " | sbatch --time=1:00:00 --mem=8G --cpus-per-task 4 --job-name=${enrichment}.${sample}.correct -o data_analysis/FLAIR/correct/${enrichment}.${sample}.log -e data_analysis/FLAIR/correct/${enrichment}.${sample}.log 
+done
+
+# merge output files 
+for f in *_all_corrected.bed; do
+  # Get the prefix (e.g., "exome_enriched.bcM0001") from the filename
+  prefix=${f%_all_corrected.bed}  # Print which files are being processed
+  echo "Combining files for ${prefix}"  # Concatenate the two files into a new combined file
+  cat "${prefix}_all_corrected.bed" "${prefix}_all_inconsistent.bed" > "${prefix}_all_combined.bed"
+done
+
+```
+
+
+# flair collapse
+```{bash}
+
+# run collapse
+for sample in "${samples[@]}"; do
+  echo -e "\
+#!/bin/bash
+flair collapse \
+  -g $ref \
+  -q data_analysis/FLAIR/correct/${enrichment}.${sample}_all_combined.bed \
+  -r data_analysis/${enrichment}/isoseq_groupdedup_deduplication/${sample}_modified.fasta \
+  --output data_analysis/FLAIR/collapse/${enrichment}.${sample} \
+  --gtf $refGTF \
+  --generate_map \
+  --stringent \
+  --support 5 \
+  --check_splice \
+  --annotation_reliant generate \
+  --threads 10 \
+  --max_ends 5 \
+  --filter comprehensive \
+  --isoformtss \
+  --no_gtf_end_adjustment \
+  --end_window 50 " | sbatch --time=84:00:00 --mem=256G --cpus-per-task 10 --job-name=${enrichment}.${sample}.collapse -o data_analysis/FLAIR/collapse/${enrichment}.${sample}.log -e data_analysis/FLAIR/collapse/${enrichment}.${sample}.log 
+done
+
+```
+
+
+# flair quantify
+```{bash}
+
+# Define the output directory
+outDir="data_analysis/FLAIR/collapse"
+# Define the output filename
+output_file="${outDir}/manifest.tsv"
+
+# --- Data Rows ---
+
+# Use > to create/overwrite the file with the first line
+# (If you added a header above, change this first > to >> to append)
+printf "%s\t%s\t%s\t%s\t%s\n" \
+  "ExoLR.1" "isoform" \
+  "${outDir}/exome_enriched.bcM0001.isoforms.bed" \
+  "${outDir}/exome_enriched.bcM0001.isoforms.fa" \
+  "${outDir}/exome_enriched.bcM0001.combined.isoform.read.map.txt" > "$output_file"
+# Note: The first line had .bed twice, kept it as in original but check if this is intended.
+#       If you added a header, change the > above to >>
+
+# Use >> to append the subsequent lines
+# Fixed the erroneous newlines in the .fa filenames
+printf "%s\t%s\t%s\t%s\t%s\n" \
+  "ExoLR.2" "isoform" \
+  "${outDir}/exome_enriched.bcM0002.isoforms.bed" \
+  "${outDir}/exome_enriched.bcM0002.isoforms.fa" \
+  "${outDir}/exome_enriched.bcM0002.combined.isoform.read.map.txt" >> "$output_file"
+
+printf "%s\t%s\t%s\t%s\t%s\n" \
+  "ExoLR.4" "isoform" \
+  "${outDir}/exome_enriched.bcM0004.isoforms.bed" \
+  "${outDir}/exome_enriched.bcM0004.isoforms.fa" \
+  "${outDir}/exome_enriched.bcM0004.combined.isoform.read.map.txt" >> "$output_file"
+
+printf "%s\t%s\t%s\t%s\t%s\n" \
+  "LR.1" "isoform" \
+  "${outDir}/no_enrichment.bcM0001.isoforms.bed" \
+  "${outDir}/no_enrichment.bcM0001.isoforms.fa" \
+  "${outDir}/no_enrichment.bcM0001.combined.isoform.read.map.txt" >> "$output_file"
+
+printf "%s\t%s\t%s\t%s\t%s\n" \
+  "LR.2" "isoform" \
+  "${outDir}/no_enrichment.bcM0002.isoforms.bed" \
+  "${outDir}/no_enrichment.bcM0002.isoforms.fa" \
+  "${outDir}/no_enrichment.bcM0002.combined.isoform.read.map.txt" >> "$output_file"
+
+printf "%s\t%s\t%s\t%s\t%s\n" \
+  "LR.4" "isoform" \
+  "${outDir}/no_enrichment.bcM0004.isoforms.bed" \
+  "${outDir}/no_enrichment.bcM0004.isoforms.fa" \
+  "${outDir}/no_enrichment.bcM0004.combined.isoform.read.map.txt" >> "$output_file"
+
+
+echo "--- TSV file '$output_file' created ---"
+# Optional: Display the created file content
+cat "$output_file"
+
+echo "--- Verification: View with columns (visual check) ---"
+# Use column command to visually check alignment (requires GNU column or similar)
+# The -s $'\t' tells it the input separator is a tab
+if command -v column &> /dev/null; then
+  column -t -s $'\t' "$output_file"
+else
+  echo "Skipping column view (command not found)."
+fi
+
+
+# first combine isoforms 
+flair_combine -m $output_file -o ${outDir}/collapsed_flairomes --endwindow 50 --convert_gtf --minpercentusage 0 --filter 0
+
+
+# Define the output filename
+output_file="data_analysis/FLAIR/quantify/reads_manifest.tsv"
+
+# Use > to create/overwrite the file with the first line
+printf "%s\t%s\t%s\t%s\n" "1" "ExoLR" "batch1" "data_analysis/exome_enriched/isoseq_groupdedup_deduplication/bcM0001_modified.fasta" > "$output_file"
+
+# Use >> to append the subsequent lines
+printf "%s\t%s\t%s\t%s\n" "2" "ExoLR" "batch1" "data_analysis/exome_enriched/isoseq_groupdedup_deduplication/bcM0002_modified.fasta" >> "$output_file"
+printf "%s\t%s\t%s\t%s\n" "4" "ExoLR" "batch1" "data_analysis/exome_enriched/isoseq_groupdedup_deduplication/bcM0004_modified.fasta" >> "$output_file"
+printf "%s\t%s\t%s\t%s\n" "1" "LR"    "batch1" "data_analysis/no_enrichment/isoseq_groupdedup_deduplication/bcM0001_modified.fasta" >> "$output_file" 
+printf "%s\t%s\t%s\t%s\n" "2" "LR"    "batch1" "data_analysis/no_enrichment/isoseq_groupdedup_deduplication/bcM0002_modified.fasta" >> "$output_file"
+printf "%s\t%s\t%s\t%s\n" "4" "LR"    "batch1" "data_analysis/no_enrichment/isoseq_groupdedup_deduplication/bcM0004_modified.fasta" >> "$output_file"
+
+echo "TSV file '$output_file' created successfully."
+
+# Optional: Display the created file content
+echo "--- File Content ---"
+cat "$output_file"
+
+# run quantify
+echo -e "\
+#!/bin/bash
+flair quantify -r data_analysis/FLAIR/quantify/reads_manifest.tsv -i data_analysis/FLAIR/collapse/collapsed_flairomes.fa --output data_analysis/FLAIR/quantify/quantify --quality 0 --threads 8 --output_bam --generate_map --isoform_bed data_analysis/FLAIR/collapse/collapsed_flairomes.bed --stringent --check_splice --temp_dir data_analysis/FLAIR/quantify/tmp " | sbatch --time=48:00:00 --mem=128G --cpus-per-task 8 --job-name=flair.quantify -o data_analysis/FLAIR/quantify/quantify.log -e data_analysis/FLAIR/quantify/quantify.log
+
+```
+
+
+# plot isoforms
+```{bash}
+
+# Can use any gene id 
+plot_isoform_usage --min_reads 5 data_analysis/FLAIR/collapse/collapsed_flairomes.bed data_analysis/FLAIR/quantify/quantify.counts.tsv ENSG00000089280
+
+```
+
+
+# filter gtf based on quantify results and make FL file 
+```{bash, eval=FALSE}
+
+
+# filter to contain at least 5 reads (not needed if previously chose -support 5)
+awk 'NR==1; NR>1{s=0; for(i=2;i<=NF;i++) s+=$i; if(s>=5) print}' data_analysis/FLAIR/quantify/quantify.counts.tsv > data_analysis/FLAIR/quantify/quantify.counts.filtered.tsv
+
+# filter gtf 
+awk '
+    BEGIN {
+        FS = "\t";
+        OFS = "\t";
+    }
+    FNR == NR {
+        if (FNR == 1) {
+            next;
+        }
+        id_from_counts = $1;
+        sub(/_[^_]*$/, "", id_from_counts);
+        valid_transcript_ids[id_from_counts] = 1;
+        next;
+    }
+    {
+        if (match($9, /transcript_id "([^"]+)"/, arr)) {
+            transcript_id_gtf = arr[1];
+            if (transcript_id_gtf in valid_transcript_ids) {
+                print $0;
+            }
+        }
+    }
+' data_analysis/FLAIR/quantify/quantify.counts.filtered.tsv data_analysis/FLAIR/collapse/collapsed_flairomes.gtf > data_analysis/FLAIR/collapse/filtered_collapsed_flairomes.gtf
+
+# remove fluff and fix order by converting to gff3 and back to gtf
+gffread data_analysis/FLAIR/quantify/filtered_collapsed_flairomes.gtf -o data_analysis/FLAIR/quantify/filtered_collapsed_flairomes.gff3 
+gffread data_analysis/FLAIR/collapse/filtered_collapsed_flairomes.gff3 -T -o data_analysis/FLAIR/collapse/filtered_collapsed_flairomes.gtf
+
+# adjust counts file for SQANTI3
+input_counts_file="data_analysis/FLAIR/quantify/quantify.counts.filtered.tsv"
+output_counts_file="data_analysis/FLAIR/quantify/quantify.counts.modified_ids.tsv" 
+
+# awk command to modify the first column and its header
+awk '
+BEGIN {
+    OFS="\t"  # Set the Output Field Separator to a tab
+}
+{
+    if (NR == 1) {  # If it is the first line (header)
+        if ($1 == "ids") { # Check if the first field is "ids"
+            $1 = "superPBID"      # Change it to "id"
+        }
+        # No sub() needed for the header, just print it after potential modification
+    } else { # For all other lines (data lines)
+        # For the first field ($1), substitute the pattern "_[^_]*$" with an empty string.
+        # This pattern means: an underscore "_", followed by zero or more characters
+        # that are NOT underscores "[^_]*", up to the end of the string "$".
+        sub(/_[^_]*$/, "", $1)
+    }
+    print $0 # Print the entire modified line
+}
+' "$input_counts_file" > "$output_counts_file"
+
+```
+
+
+# run SQANTI QC on isoforms
+```{bash, eval=FALSE}
+
+#!/bin/bash
+wrk=/hpc/hers_en/shared/chiem
+req=/hpc/hers_en/cvandijk/longRead_singleNucleus/pipeline/requiredFiles/
+transcriptGTF=$wrk/data_analysis/FLAIR/collapse/filtered_collapsed_flairomes.gtf
+refFASTA=$req/human_GRCh38_no_alt_analysis_set.fasta
+refGTF=$req/gencode.v46.annotation.sorted.gtf
+outPrefix=SQANTI_QC
+out=${wrk}/FLAIR/SQANTI
+tss=$req/refTSS_v3.3_human_coordinate.hg38.sorted.bed
+polyA=$req/polyA.list.txt
+polyApeak=$wrk/reference/atlas.clusters.2.0.GRCh38.96.bed
+flncCount=${wrk}/data_analysis/FLAIR/quantify/quantify.counts.modified_ids.tsv
+
+cd $wrk/SQANTI3-5.3.5
+
+python sqanti3_qc.py $transcriptGTF $refGTF $refFASTA \
+                     -o $outPrefix -d $out \
+                     --CAGE_peak $tss \
+                     --polyA_motif_list $polyA \
+                     --polyA_peak $polyApeak \
+                     --force_id_ignore \
+                     -fl $flncCount --genename \
+                     --cpus 4 --report both \
+
+echo "Got to the end"
+
+```
+
+## run it
+```{bash}
+
+conda activate sqanti3
+echo -e "\
+#!/bin/bash
+${wrk}/data_analysis/FLAIR/SQANTI/SQANTI_QC.sh" | sbatch --time 24:00:00 --mem 64G --job-name SQANTIQC -o ${wrk}/data_analysis/FLAIR/SQANTI/SQANTI_QC.log -e ${wrk}/data_analysis/FLAIR/SQANTI/SQANTI_QC.log
+
+```
+
+
+# Merge bams, get depth, and TSS position
+
+srun  --time 1:00:00 --mem 120G --pty bash
+```{bash}
+
+# BAM files to merge
+BAM_FILES=$(ls data_analysis/FLAIR/quantify/quantify.*.*.flair.aligned.bam)
+OUTPUT_BAM="data_analysis/FLAIR/quantify/combined.flair.bam"
+samtools merge -@ $(nproc --all) -r -o ${OUTPUT_BAM} ${BAM_FILES}
+samtools index ${OUTPUT_BAM}
+
+# turn to fasta
+FASTA="data_analysis/FLAIR/quantify/combined.flair.fasta.gz"
+samtools fasta -F 4 -0 "$FASTA" "${OUTPUT_BAM}"
+
+# align to genome
+req=/hpc/hers_en/cvandijk/longRead_singleNucleus/pipeline/requiredFiles/
+
+echo -e "\
+#!/bin/bash  
+minimap2 -ax splice:hq -t 8 -uf --secondary=no  \
+    ${req}/human_GRCh38_no_alt_analysis_set.mmi \
+    ${FASTA} | \
+samtools view -@ 8 -bS - | \
+samtools sort -@ 8 -o data_analysis/FLAIR/quantify/combined.flair.aligned.bam - " | sbatch --time 24:00:00 --mem 64G --cpus-per-task 8 --job-name mm2 -o data_analysis/FLAIR/quantify/mm2.log -e data_analysis/FLAIR/quantify/mm2.log 
+
+# get depth 
+samtools depth data_analysis/FLAIR/quantify/combined.flair.aligned.bam > data_analysis/FLAIR/quantify/gene_depth.txt
+
+# filter bed file based on quantify results
+counts_file="data_analysis/FLAIR/quantify/quantify.counts.filtered.tsv"
+bed_file="data_analysis/FLAIR/collapse/collapsed_flairomes.bed"
+output_filtered_bed="data_analysis/FLAIR/collapse/filtered_collapsed_flairomes.bed"
+
+awk '
+    BEGIN {
+        FS="\t"; OFS="\t"; # Set field separators for input and output
+    }
+
+    # Processing the first file (counts_file)
+    FNR==NR {
+        if (FNR == 1) { # Skip the header line of the counts file
+            next;
+        }
+        valid_ids[$1] = 1; # Store the ID from the first column in an array
+                           # The value "1" is arbitrary, we just care about the key existing.
+        next; # Skip to the next line of the counts_file
+    }
+
+    # Processing the second file (bed_file)
+    # This block is executed only when FNR != NR
+    {
+        # The 4th column in a BED file is the "name" field.
+        # We check if this name (ID) is present in our valid_ids array.
+        if ($4 in valid_ids) {
+            print $0; # If it is, print the entire current line from the BED file.
+        }
+    }
+' "$counts_file" "$bed_file" > "$output_filtered_bed"
+
+# determine TSS genomic positions 
+awk 'BEGIN {OFS="\t"} { if ($6 == "+") { tss = $2; } else if ($6 == "-") { tss = $3; } else { tss = "?"; } print $0, tss; }' data_analysis/FLAIR/collapse/filtered_collapsed_flairomes.bed > data_analysis/FLAIR/collapse/filtered_collapsed_flairomes_tss.bed
+
+```
+
+
+# script for getting TSS ratio
+```{bash}
+
+# --- Configuration ---
+BED_FILE_WITH_TSS="data_analysis/FLAIR/collapse/filtered_collapsed_flairomes_tss.bed"
+DEPTH_FILE="data_analysis/FLAIR/quantify/gene_depth.txt"
+OUTPUT_FILE="data_analysis/FLAIR/collapse/filtered_collapsed_flairomes_tss_depth.bed"
+WINDOWS_BED_TMP="tss_windows.bed.tmp"
+WINDOWS_BED_SORTED_TMP="tss_windows.sorted.bed.tmp"
+DEPTH_BED_TMP="depth_points.bed.tmp"
+INTERSECT_TMP="intersect.tmp"
+SUMS_TMP="sums_per_line.tmp"
+SORT_TEMP_DIR="apptainer_tmp"
+
+# --- Check if temp dir exists ---
+if [ ! -d "$SORT_TEMP_DIR" ]; then
+    echo "Error: Temporary directory '$SORT_TEMP_DIR' does not exist. Please create it or change the path."
+    exit 1
+fi
+
+echo "Step 1a: Creating TSS window BED file..."
+awk 'BEGIN{OFS="\t"} {
+    tss = $NF;
+    start_coord = tss - 100;
+    if (start_coord < 0) start_coord = 0;
+    end_coord = tss + 100 + 1;
+    id = FNR ":" tss;
+    print $1, start_coord, end_coord, id, "0", "+";
+}' "$BED_FILE_WITH_TSS" > "$WINDOWS_BED_TMP"
+
+echo "Step 1b: Sorting TSS window BED file (using version sort)..."
+# Use -T for consistency, although this file is likely smaller
+sort -T "$SORT_TEMP_DIR" -k1,1 -k2,2n -o "$WINDOWS_BED_SORTED_TMP" "$WINDOWS_BED_TMP"
+rm "$WINDOWS_BED_TMP"
+
+echo "Step 2: Preparing depth file in BED format..."
+awk 'BEGIN{OFS="\t"} { print $1, $2-1, $2, $3 }' "$DEPTH_FILE" > "$DEPTH_BED_TMP"
+
+echo "Step 3: Intersecting windows with depth points using bedtools (ensuring consistent sort with temp dir)..."
+# Added -T "$SORT_TEMP_DIR" to the sort command within process substitution
+bedtools intersect \
+    -a "$WINDOWS_BED_SORTED_TMP" \
+    -b <(sort -T "$SORT_TEMP_DIR" -k1,1 -k2,2n "$DEPTH_BED_TMP") \
+    -wa -wb -sorted > "$INTERSECT_TMP"
+
+if [ ! -s "$INTERSECT_TMP" ]; then
+    echo "Warning: bedtools intersect did not produce any output. Check intermediate files or potential sort issues."
+fi
+
+echo "Step 4: Aggregating depths from intersection..."
+awk 'BEGIN{FS=OFS="\t"} {
+    split($4, id_parts, ":");
+    line_nr = id_parts[1];
+    tss = id_parts[2];
+    depth_pos = $9;
+    depth_val = $10;
+
+    if (depth_pos < tss && depth_pos >= tss - 100) {
+        upstream[line_nr] += depth_val;
+        if (!(line_nr in downstream)) downstream[line_nr] = 0;
+    } else if (depth_pos >= tss && depth_pos <= tss + 100) {
+        downstream[line_nr] += depth_val;
+        if (!(line_nr in upstream)) upstream[line_nr] = 0;
+    }
+}
+END {
+    for (lnr in upstream) {
+        print lnr, upstream[lnr]+0, downstream[lnr]+0;
+    }
+}' "$INTERSECT_TMP" | sort -T "$SORT_TEMP_DIR" -k1,1n > "$SUMS_TMP" # Added -T here too for consistency
+
+echo "Step 5: Merging sums with original BED file..."
+awk 'BEGIN{OFS="\t"}
+     NR==FNR {
+         up[$1] = $2;
+         down[$1] = $3;
+         next;
+     }
+     {
+         print $0, (FNR in up ? up[FNR] : 0), (FNR in down ? down[FNR] : 0);
+     }' "$SUMS_TMP" "$BED_FILE_WITH_TSS" > "$OUTPUT_FILE"
+
+echo "Step 6: Cleaning up temporary files..."
+# Only remove if they exist
+[ -f "$WINDOWS_BED_SORTED_TMP" ] && rm "$WINDOWS_BED_SORTED_TMP"
+[ -f "$DEPTH_BED_TMP" ] && rm "$DEPTH_BED_TMP"
+[ -f "$INTERSECT_TMP" ] && rm "$INTERSECT_TMP"
+[ -f "$SUMS_TMP" ] && rm "$SUMS_TMP"
+
+echo "Done. Final output written to $OUTPUT_FILE"
+
+```
+
+
+# script for adding ATAC peaks
+```{bash}
+#!/bin/bash
+
+# Input and Output files
+flair_file="data_analysis/FLAIR/collapse/filtered_collapsed_flairomes_tss_depth_ratio.bed"
+atac_file_original="data_analysis/FLAIR/peak_locations_john_multiome.bed"
+output_file="data_analysis/FLAIR/collapse/filtered_collapsed_flairomes_tss_ATAC.bed"
+
+# Temporary files
+flair_tss_temp="flair_tss_for_bedtools.tmp.bed"
+flair_tss_sorted_temp="flair_tss_for_bedtools.sorted.tmp.bed"
+atac_sorted_temp="peaks.sorted.tmp.bed"
+intersect_output_temp="flair_tss_intersect_count.tmp.txt"
+closest_output_temp="flair_tss_closest_details.tmp.txt"
+
+# --- Step 0: Store original flair lines mapped by NR ---
+echo "Step 0: Caching original FLAIR lines..."
+declare -A original_flair_lines_map # Associative array for bash
+awk '{print NR "\t" $0}' "$flair_file" > flair_lines_with_nr.tmp.txt
+
+# --- Step 1: Prepare FLAIR TSS temporary BED file ---
+# Columns: 1:chr, 2:tss_start (0-based), 3:tss_end (0-based, tss_pos+1 for a point),
+#          4:original_line_number (NR) -- This is the key
+#          5:flair_strand(original col6)
+#          6:tss_pos_for_calc (original $(NF-3) - for distance calc later)
+echo "Step 1: Preparing FLAIR TSS BED file..."
+awk 'BEGIN{OFS="\t"} {
+    tss_pos_val = $(NF-3); # TSS is the 4th field from the end
+    # Assuming tss_pos_val is 0-based. If 1-based, adjust here: tss_pos_val - 1
+    print $1, tss_pos_val, tss_pos_val+1, NR, $6, tss_pos_val;
+}' "$flair_file" > "$flair_tss_temp"
+
+# --- Step 2: Sort temporary FLAIR TSS BED and the ATAC peak BED ---
+echo "Step 2: Sorting BED files..."
+sort -k1,1 -k2,2n "$flair_tss_temp" > "$flair_tss_sorted_temp"
+sort -k1,1 -k2,2n "$atac_file_original" > "$atac_sorted_temp"
+
+# --- Step 3: Use bedtools intersect to count overlaps ---
+# -wa: write original A entry
+# -c: count overlaps from B
+# -sorted: input files are sorted
+echo "Step 3: Running bedtools intersect..."
+bedtools intersect -a "$flair_tss_sorted_temp" -b "$atac_sorted_temp" -wa -c -sorted > "$intersect_output_temp"
+# Output of intersect:
+# A_chr ($1), A_tss_start ($2), A_tss_end ($3), A_NR ($4), A_strand ($5), A_tss_pos_for_calc ($6)
+# overlap_count ($7)
+
+# --- Step 4: Use bedtools closest to find nearest ATAC peak ---
+# -t first: report first feature in B if multiple have same closest distance.
+# -d: report distance.
+# -sorted: input files are sorted
+echo "Step 4: Running bedtools closest..."
+bedtools closest -a "$flair_tss_sorted_temp" -b "$atac_sorted_temp" -t first -d -sorted > "$closest_output_temp"
+# Output of closest:
+# A_chr ($1), A_tss_start ($2), A_tss_end ($3), A_NR ($4), A_strand ($5), A_tss_pos_for_calc ($6)
+# B_chr ($7), B_peak_start ($8), B_peak_end ($9)
+# distance_val_from_d ($10)
+
+# --- Step 5: Use awk to combine results and calculate final columns ---
+echo "Step 5: Combining results with awk..."
+awk '
+BEGIN { FS=OFS="\t" }
+
+# First, load the original flair lines into memory
+# This ARGIND block is new, processes flair_lines_with_nr.tmp.txt first
+ARGIND == 1 {
+    original_flair_lines_map[$1] = $2; # Key is NR, value is the rest of the line ($0 from flair)
+    for (i=3; i<=NF; i++) original_flair_lines_map[$1] = original_flair_lines_map[$1] OFS $i;
+    next;
+}
+
+# Second, read the intersect output (overlap counts)
+# A_chr ($1), A_tss_start ($2), A_tss_end ($3), A_NR ($4), A_strand ($5), A_tss_pos_for_calc ($6), overlap_count ($7)
+ARGIND == 2 {
+    key_NR = $4; # This is A_NR
+    within_site[key_NR] = ($7 > 0 ? "TRUE" : "FALSE"); # $7 is overlap_count
+    next;
+}
+
+# Third, read the closest output and print combined results
+# A_chr ($1), A_tss_start ($2), A_tss_end ($3), A_NR ($4), A_strand ($5), A_tss_pos_for_calc ($6)
+# B_chr ($7), B_peak_start ($8), B_peak_end ($9), distance_val_from_d ($10)
+ARGIND == 3 {
+    key_NR = $4;               # This is A_NR
+    flair_strand_val = $5;     # This is A_strand
+    flair_tss_coordinate = $6; # This is A_tss_pos_for_calc
+
+    peak_chr_B = $7;
+    peak_start_B = $8;
+    peak_end_B = $9;
+    # $10 is distance_val_from_d, not directly used for our ATAC_dist calculation logic here
+
+    atac_distance_calculated = "NA";
+
+    if (peak_chr_B != "." && peak_start_B != "-1" && peak_start_B != ".") {
+        numeric_peak_start_B = peak_start_B + 0;
+        numeric_peak_end_B = peak_end_B + 0;
+        peak_center = int((numeric_peak_start_B + numeric_peak_end_B) / 2);
+
+        if (flair_strand_val == "+") {
+            atac_distance_calculated = peak_center - flair_tss_coordinate;
+        } else if (flair_strand_val == "-") {
+            atac_distance_calculated = flair_tss_coordinate - peak_center;
+        } else {
+            atac_distance_calculated = "STRAND_ERROR";
+        }
+    }
+
+    # Print the original flair line (retrieved using NR), followed by the two new columns
+    if (key_NR in original_flair_lines_map) {
+        print original_flair_lines_map[key_NR], within_site[key_NR], atac_distance_calculated;
+    } else {
+        print "ERROR: Original line not found for NR " key_NR > "/dev/stderr";
+    }
+}
+' flair_lines_with_nr.tmp.txt "$intersect_output_temp" "$closest_output_temp" > "$output_file"
+
+
+# --- Step 6: Clean up temporary files ---
+echo "Step 6: Cleaning up temporary files..."
+rm "$flair_tss_temp" "$flair_tss_sorted_temp" "$atac_sorted_temp" \
+   "$intersect_output_temp" "$closest_output_temp" flair_lines_with_nr.tmp.txt
+
+echo "Processing complete. Output written to: $output_file"
+echo "Head of the output file:"
+head "$output_file"
+
+```
+
+
+## run scripts, get TSS ratio, and distance to ATAC peaks
+```{bash}
+
+# run TSS script
+echo -e "\
+#!/bin/bash
+data_analysis/FLAIR/SQANTI/TSS_ratio.sh" | sbatch --time 48:00:00 --mem 32G --job-name TSS_ratio.sh -o data_analysis/FLAIR/SQANTI/TSS_ratio.log -e data_analysis/FLAIR/SQANTI/TSS_ratio.log
+
+# add actual ratio
+awk 'BEGIN{OFS="\t"} {
+    # $0 is the whole line
+    # $(NF-1) is the second to last column (upstream depth)
+    # $NF is the last column (downstream depth)
+    # $6 is the strand column
+
+    up_depth = ($(NF-1) == 0 ? 1 : $(NF-1));
+    down_depth = ($NF == 0 ? 1 : $NF);
+    strand = $6;
+    ratio = "NA"; # Default value if strand is not + or -
+
+    if (strand == "+") {
+        ratio = down_depth / up_depth;
+    } else if (strand == "-") {
+        ratio = up_depth / down_depth;
+    }
+
+    # Print the original line and then the calculated ratio
+    # If you want a specific number of decimal places for the ratio:
+    # printf "%s\t%.4f\n", $0, ratio; # For 4 decimal places
+    # Otherwise, just print for default precision:
+    print $0, ratio;
+
+}' data_analysis/FLAIR/collapse/filtered_collapsed_flairomes_tss_depth.bed > data_analysis/FLAIR/collapse/filtered_collapsed_flairomes_tss_depth_ratio.bed
+
+# convert ATAC to bed 
+awk -F '[:-]' 'BEGIN{OFS="\t"} {print $1, $2-1, $3}' peak_locations_john_multiome.txt > peak_locations_john_multiome.bed
+
+# run script to add peaks
+bash data_analysis/FLAIR/SQANTI/ATAC.sh
+
+# merge classification with TSS ratio and peaks
+awk '
+BEGIN {
+    FS_input="\t"; # Input field separator
+    OFS="\t";     # Output field separator
+
+    # New column names
+    new_header_1 = "UpstreamDepth";
+    new_header_2 = "DownstreamDepth";
+    new_header_3 = "TSS_Ratio";
+    new_header_4 = "within_ATAC_site"; # New
+    new_header_5 = "ATAC_dist";        # New
+}
+
+# --- First file: data_analysis/FLAIR/collapse/collapsed_flairomes_tss_ATAC.bed ---
+NR==FNR {
+    n_bed_fields = split($0, bed_fields, FS_input);
+    
+    # Original Key Extraction from BED Column 4 (bed_fields[4])
+    num_parts = split(bed_fields[4], parts, "_");
+    key_bed = "";
+    if (num_parts > 1) {
+        key_bed = parts[1];
+        for (i = 2; i < num_parts; i++) { # Loop up to num_parts-1
+            key_bed = key_bed "_" parts[i];
+        }
+    } else {
+        key_bed = bed_fields[4];
+    }
+
+    # Store the actual last FIVE columns from the BED file
+    # $(NF-4) is UpstreamDepth
+    # $(NF-3) is DownstreamDepth
+    # $(NF-2) is TSS_Ratio
+    # $(NF-1) is within_ATAC_site
+    # $(NF)   is ATAC_dist
+    data_store[key_bed,1] = bed_fields[n_bed_fields-4]; # UpstreamDepth
+    data_store[key_bed,2] = bed_fields[n_bed_fields-3]; # DownstreamDepth
+    data_store[key_bed,3] = bed_fields[n_bed_fields-2]; # TSS_Ratio
+    data_store[key_bed,4] = bed_fields[n_bed_fields-1]; # within_ATAC_site
+    data_store[key_bed,5] = bed_fields[n_bed_fields];   # ATAC_dist
+    next;
+}
+
+# --- Second file: data_analysis/FLAIR/SQANTI/SQANTI_QC_classification.txt ---
+{
+    if (FNR == 1) { # Header line of the classification file
+        sub(/\r$/, "", $0); 
+        print $0 OFS new_header_1 OFS new_header_2 OFS new_header_3 OFS new_header_4 OFS new_header_5;
+    } else { # Data lines
+        key_txt = $1; # First column is the isoform key
+
+        val1 = ( (key_txt,1) in data_store ? data_store[key_txt,1] : "NA" );
+        val2 = ( (key_txt,2) in data_store ? data_store[key_txt,2] : "NA" );
+        val3 = ( (key_txt,3) in data_store ? data_store[key_txt,3] : "NA" );
+        val4 = ( (key_txt,4) in data_store ? data_store[key_txt,4] : "NA" ); # New
+        val5 = ( (key_txt,5) in data_store ? data_store[key_txt,5] : "NA" ); # New
+        
+        sub(/\r$/, "", $0);
+        print $0 OFS val1 OFS val2 OFS val3 OFS val4 OFS val5;
+    }
+}
+' data_analysis/FLAIR/collapse/filtered_collapsed_flairomes_tss_ATAC.bed \
+  data_analysis/FLAIR/SQANTI/SQANTI_QC_classification.txt \
+  > data_analysis/FLAIR/SQANTI/SQANTI_QC_classification_TSS_ATAC.txt
+  
+```
+
+
+# analyze classification
+```{R}
+library(stringr)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(tidyr)
+
+# load files
+isoforms <- read.delim('~/School/longshort/FLAIR_classification.txt', header = TRUE, sep = "\t")
+
+# add classification
+isoforms$novel <- startsWith(isoforms$isoform, "flair")
+isoforms$five_prime_depth <- ifelse(isoforms$strand == "+",
+                                    isoforms$DownstreamDepth,
+                                    isoforms$UpstreamDepth)
+
+# add total_counts
+isoforms <- isoforms %>%
+  mutate(total_counts = rowSums(across(starts_with("FL")), na.rm = TRUE))
+
+
+# filter
+isoforms_categorized <- isoforms %>%
+  mutate(
+    # --- Define logical flags for each category based on your original filters ---
+
+    # Flag for "Novel 3' (and known 5')" - based on 'three' filter
+    flag_novel_three = (
+      (abs(diff_to_gene_TTS) >= 50) &  # TTS unknown
+      (polyA_motif_found == TRUE & perc_A_downstream_TTS < 80) & # TTS reliable
+      (abs(diff_to_gene_TSS) < 50) & # TSS known
+      ((within_CAGE_peak == TRUE | (ATAC_dist > -500 & ATAC_dist < 250))) & # TSS reliable
+      (total_counts >= 5 & RTS_stage == FALSE) # General reliability
+    ),
+
+    # Flag for "Novel 5' (and known 3')" - based on 'five' filter
+    flag_novel_five = (
+      (abs(diff_to_gene_TTS) < 50) & # TTS known
+      (polyA_motif_found == TRUE & perc_A_downstream_TTS < 80 & abs(dist_to_polyA_site) < 100) & # TTS reliable
+      (abs(diff_to_gene_TSS) >= 50) & # TSS unknown
+      ((within_CAGE_peak == TRUE | (ATAC_dist > -500 & ATAC_dist < 250)) & (five_prime_depth > 1000 & TSS_Ratio > 1.5)) & # TSS reliable
+      (total_counts >= 5 & RTS_stage == FALSE) # General reliability
+    ),
+
+    # Flag for "Novel 5' and 3'" - based on 'fivethree' filter
+    flag_novel_fivethree = (
+      (abs(diff_to_gene_TTS) >= 50) &  # TTS unknown
+      (polyA_motif_found == TRUE & perc_A_downstream_TTS < 80) & # TTS reliable
+      (abs(diff_to_gene_TSS) >= 50) & # TSS unknown
+      ((within_CAGE_peak == TRUE | (ATAC_dist > -500 & ATAC_dist < 250)) & (five_prime_depth > 1000 & TSS_Ratio > 1.5)) & # TSS reliable
+      (total_counts >= 5 & RTS_stage == FALSE) # General reliability
+    ),
+
+    # Flag for not novel
+    flag_not_novel = (
+      (abs(diff_to_gene_TTS) < 50) &  # TTS known
+      (polyA_motif_found == TRUE & perc_A_downstream_TTS < 80 & abs(dist_to_polyA_site) < 100) & # TTS reliable
+      (abs(diff_to_gene_TSS) < 50) & # TSS known
+      ((within_CAGE_peak == TRUE | (ATAC_dist > -500 & ATAC_dist < 250))) & # TSS reliable
+      (total_counts >= 5 & RTS_stage == FALSE) # General reliability
+    ),
+
+    # --- Determine 'end_novelty' column ---
+    # The order in case_when is important. Check for 'both' first.
+    # The flags are defined such that they are mutually exclusive for the "novel end" type.
+    end_novelty = case_when(
+      flag_novel_fivethree                                 ~ "Novel 5' and 3'",
+      flag_novel_three                                   ~ "Novel 3'",
+      flag_novel_five                                    ~ "Novel 5'",
+      # If it meets general reliability but isn't novel in its ends
+      flag_not_novel                                     ~ "Not Novel",
+      TRUE                                               ~ "Not Reliable" # Catch-all
+    )
+  ) %>%
+  # Remove the temporary flag columns
+  select(-flag_novel_three, -flag_novel_five, -flag_novel_fivethree, -flag_not_novel)
+
+# This is a more concise alternative if you plan to filter out other categories.
+isoforms_categorized <- isoforms_categorized %>%
+  mutate(
+    # Step 1: RENAME categories to abbreviations.
+    # The `case_when` function is perfect for this explicit mapping.
+    structural_category = case_when(
+      structural_category == "full-splice_match"      ~ "FSM",
+      structural_category == "incomplete-splice_match" ~ "ISM",
+      structural_category == "novel_in_catalog"        ~ "NIC",
+      structural_category == "novel_not_in_catalog"   ~ "NNC", # Changed to NNC for consistency
+      # This next line is a robust fallback: it cleans up any other
+      # categories (like 'genic_intron' -> 'Genic Intron') automatically.
+      TRUE                                             ~ str_to_title(str_replace_all(structural_category, "_", " "))
+    ),
+
+    # Step 2: Now that the names are correct, REORDER them as a factor.
+    # `fct_relevel` will place these four at the front in this specific order.
+    structural_category = fct_relevel(
+      structural_category,
+      "FSM", "ISM", "NIC", "NNC"
+    )
+  )
+
+# --- Prepare the data for plotting (now much simpler) ---
+plot_data_processed <- isoforms_categorized %>%
+  # The names are already clean, so we just filter and count
+  filter(
+    !structural_category %in% c("Fusion", "Genic"), # Use the new, clean names
+    !is.na(structural_category),
+    !end_novelty == 'Not Reliable'
+  ) %>%
+  count(structural_category, end_novelty, name = "count")
+
+# --- Create the final, styled stacked bar chart ---
+plot_stacked_styled <- ggplot(plot_data_processed, aes(x = structural_category, y = count, fill = end_novelty)) +
+  geom_bar(stat = "identity", position = "stack", color = "black", linewidth = 0.3) +
+
+  # --- MODIFICATION: Switched to a high-contrast, colorblind-friendly palette ---
+  # See below for more palette options.
+  scale_fill_viridis_d(option = "D") + # "D" is the default 'viridis' palette
+
+  # --- Labels using the consistent style ---
+  labs(
+    x = "",
+    y = "Number of Isoforms",
+    fill = "" # Sets the legend title
+  ) +
+
+  # --- Base theme and detailed theme customizations ---
+  theme_bw(base_size = 12) +
+  theme(
+    # Panel styling (unchanged)
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.5),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+
+    # Axis styling
+    axis.title = element_text(size = rel(1.1)),
+    axis.text.y = element_text(size = rel(0.9), color = "black"),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+
+    # --- MODIFICATION: Added face = "bold" to the x-axis text ---
+    axis.text.x = element_text(
+      size = rel(1.1), color = "black", face = "bold"
+    ),
+
+    # Legend styling (unchanged)
+    legend.position = "top",
+    legend.title = element_text(size = rel(1.0), face = "bold"),
+    legend.text = element_text(size = rel(1.0)),
+    legend.key.size = unit(1.0, "lines"),
+    legend.background = element_blank(),
+    legend.box.background = element_blank(),
+
+    # Plot styling (unchanged)
+    plot.background = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = rel(1.3)),
+    plot.subtitle = element_text(hjust = 0.5, size = rel(1.1)),
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 5, unit = "pt")
+  )
+
+# --- Print the final plot ---
+print(plot_stacked_styled)
+
+# --- Data Preparation for Stacked Bar Chart ---
+plot_data_stacked <- isoforms_categorized %>%
+  # 1. Filter for reliable isoforms
+  filter(end_novelty != "Not Reliable" & !structural_category %in% c("Fusion", "Genic"), # Use the new, clean names
+) %>%
+
+  # 2. Reshape data to long format, keeping structural_category
+  pivot_longer(
+    cols = c(FL.2_ExoLR_batch1, FL.2_LR_batch1, FL.4_ExoLR_batch1, FL.4_LR_batch1),
+    names_to = "sample",
+    values_to = "read_counts"
+  ) %>%
+
+  # 3. Create the main grouping variable
+  mutate(group = ifelse(grepl("ExoLR", sample), "ExoLR", "LR")) %>%
+
+  # 4. Group by the main group AND the stacking variable
+  group_by(group, structural_category) %>%
+
+  # 5. Calculate total reads for each sub-group
+  summarise(total_reads = sum(read_counts), .groups = 'drop')
+
+# --- Plotting Code ---
+ggplot(plot_data_stacked, aes(x = group, y = total_reads, fill = structural_category)) +
+
+  # Use geom_bar with stat="identity" for pre-summarized data.
+  # position="stack" is the default, but we can be explicit.
+  geom_bar(stat = "identity", position = "stack", color = "black", linewidth = 0.5) +
+
+  # NOTE: The color scale is now mapped to 'structural_category', not 'Group'.
+  scale_fill_viridis_d(option = "D") +
+
+  # Start applying the theme from your example
+  theme_bw(base_size = 11) +
+
+  labs(
+    x = "", # Keep x-axis label blank as requested
+    y = "Read Count",
+    fill = "" # Set a descriptive legend title
+  ) +
+
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.5),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+    axis.title.y = element_text(size = rel(1.1)),
+    axis.text.x = element_text(size = rel(1.1), color = "black", face = "bold"), # Made x-axis text slightly larger
+    axis.text.y = element_text(size = rel(0.9), color = "black"),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    legend.position = "top",
+    legend.title = element_text(face = "bold"), # Make legend title bold
+    legend.text = element_text(size = rel(1.0)),
+    legend.key.size = unit(1.0, "lines"),
+    legend.background = element_blank(),
+    legend.box.background = element_blank(),
+    plot.background = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = rel(1.3)),
+    plot.subtitle = element_text(hjust = 0.5, size = rel(1.1))
+  ) +
+
+  # Ensure the bars sit on the y=0 line and add some space at the top
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))
+
+
+# --- 2. Define Consistent Plotting Theme & Palettes ---
+theme_publication <- function(base_size = 12) {
+  theme_bw(base_size = base_size) +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(size = rel(1.1)),
+    axis.text = element_text(size = rel(0.9), color = "black"),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    legend.position = "top",
+    legend.background = element_blank(),
+    legend.box.background = element_blank(),
+    legend.title = element_text(size = rel(1.0), face = "bold"),
+    legend.text = element_text(size = rel(1.0)),
+    plot.background = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = rel(1.3)),
+    plot.subtitle = element_text(hjust = 0.5, size = rel(1.1)),
+    plot.margin = margin(5, 5, 5, 5, unit = "pt")
+  )
+}
+
+palette_sample <- c("ExoLR" = "#ff7f0e", "LR" = "#1f77b4") # Red/Blue
+
+# --- 3. Reusable Histogram Function ---
+create_distribution_plot <- function(data, column, bin_width, x_limits, title_text, x_label_text) {
+  ggplot(data, aes(x = .data[[column]])) +
+    geom_histogram(binwidth = bin_width, fill = "#377EB8", color = "black", alpha = 0.8) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "red", linewidth = 1) +
+    coord_cartesian(xlim = x_limits) +
+    labs(title = title_text, x = x_label_text, y = "Frequency") +
+    theme_publication() +
+    theme(
+      panel.grid.major.x = element_line(color = "grey90", linewidth = 0.5),
+      panel.grid.major.y = element_line(color = "grey90", linewidth = 0.5)
+    )
+}
+
+# --- 4. Generate & Display Histograms ---
+isoforms_peak <- filter(isoforms_categorized, diff_to_TSS < 50)
+
+# Plot 1: ATAC Peak Distance
+create_distribution_plot(
+  data = isoforms_peak,
+  column = "ATAC_dist",
+  bin_width = 50,
+  x_limits = c(-2000, 2000),
+  title_text = "",
+  x_label_text = "Distance to ATAC Peak"
+)
+
+# Plot 2: PolyA Site Distance
+create_distribution_plot(
+  data = isoforms_peak,
+  column = "dist_to_polyA_site",
+  bin_width = 5,
+  x_limits = c(-200, 200),
+  title_text = "",
+  x_label_text = "Distance to Nearest PolyA Site"
+)
+
+# --- 5. Filtering Summary Table & Plot ---
+filter_list <- list(
+  "Has polyA motif" = rlang::expr(polyA_motif_found == TRUE),
+  "Perc A downstream < 80" = rlang::expr(perc_A_downstream_TTS < 80),
+  "PolyA site dist < 100" = rlang::expr(abs(dist_to_polyA_site) < 100),
+  "TSS in CAGE" = rlang::expr(within_CAGE_peak == TRUE),
+  "TSS in ATAC" = rlang::expr(between(ATAC_dist, -500, 250)),
+  "TSS depth & ratio" = rlang::expr(five_prime_depth > 1000 & TSS_Ratio > 1.5)
+)
+
+# Calculate total reads once for percentage calculation
+total_reads <- isoforms_categorized %>%
+  summarise(
+    ExoLR = sum(c_across(contains("ExoLR")), na.rm = TRUE),
+    LR = sum(c_across(contains("_LR_")), na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "Sample_Type", values_to = "Total_Reads")
+
+# --- CORRECTED LINE ---
+# We must use !!.x to evaluate the expression stored in the list.
+summary_df <- purrr::map_dfr(filter_list, ~filter(isoforms_categorized, !!.x), .id = "Check") %>%
+  group_by(Check) %>%
+  summarise(
+    ExoLR = sum(c_across(contains("ExoLR")), na.rm = TRUE),
+    LR = sum(c_across(contains("_LR_")), na.rm = TRUE)
+  ) %>%
+  pivot_longer(-Check, names_to = "Sample_Type", values_to = "Passing_Reads") %>%
+  left_join(total_reads, by = "Sample_Type") %>%
+  mutate(Percentage = (Passing_Reads / Total_Reads))
+
+# --- Plotting Code (unchanged) ---
+ggplot(summary_df, aes(x = Percentage, y = fct_rev(Check), fill = Sample_Type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_manual(values = palette_sample, name = "") +
+  labs(
+    x = "Percentage of Reads Passing", y = ""
+  ) +
+  theme_publication() +
+  theme(panel.grid.major.x = element_line(color = "grey90", linewidth = 0.5))
+
+# Get list of passed isoforms
+passed <- isoforms_categorized %>%
+  filter(!end_novelty == 'Not Reliable')
+list <- passed$associated_gene
+
+# save names 
+writeLines(list, "~/School/longshort/isoforms.txt") 
+
+# Import the BED file
+bed <- fread('~/School/longshort/collapsed_flairomes.bed')
+
+# filter bed
+pattern <- paste(list, collapse = "|")
+filtered_bed <- bed %>%
+  filter(str_detect(V4, pattern))
+
+# Write the filtered data.table to a new BED file
+fwrite(filtered_bed, 
+       file = '~/School/longshort/filtered_collapsed_flairomes.bed', 
+       sep = "\t",           # Use tabs as the separator
+       col.names = FALSE,    # Do not write a header line
+       quote = FALSE)         # Do not put quotes around the fields
+
+```
+
+
+# create table describing filters
+```{R}
+library(gt)
+library(dplyr)
+
+# 1. Create a data frame using clear, descriptive English for the criteria.
+filter_summary_df_english <- tibble::tribble(
+  ~`Criterion Group`, ~`Criterion`, ~`Novel 5' & 3'`, ~`Novel 5'`, ~`Novel 3'`, ~`Not Novel (Known)`,
+  #--- General Reliability ---
+  "General Reliability", "Minimum number of supporting reads", "≥ 5", "≥ 5", "≥ 5", "≥ 5",
+  "General Reliability", "RT-switching artifact", "No", "No", "No", "No",
+  
+  #--- TSS (5' end) Criteria ---
+  "TSS (5' end) Criteria", "TSS distance to annotated gene TSS", "≥ 50 bp away", "≥ 50 bp away", "< 50 bp away", "< 50 bp away",
+  "TSS (5' end) Criteria", "TSS is supported by CAGE peak or ATAC peak", "Yes", "Yes", "Yes", "Yes",
+  "TSS (5' end) Criteria", "TSS Ratio > 1.5", "Yes", "Yes", "N/A", "N/A",
+  
+  #--- TTS (3' end) Criteria ---
+  "TTS (3' end) Criteria", "TTS distance to annotated gene TTS", "≥ 50 bp away", "< 50 bp away", "≥ 50 bp away", "< 50 bp away",
+  "TTS (3' end) Criteria", "PolyA signal present and %A downstream < 80", "Yes", "Yes", "Yes", "Yes",
+  "TTS (3' end) Criteria", "TTS is within 100 bp of annotated polyA site", "N/A", "Yes", "N/A", "Yes"
+)
+
+# 2. Use 'gt' to create the final, readable table
+isoform_filter_table_english <- filter_summary_df_english %>%
+  gt(
+    rowname_col = "Criterion",
+    groupname_col = "Criterion Group"
+  ) %>%
+  # --- Add Titles and Headers ---
+
+  tab_stubhead(label = "Filter Criterion") %>%
+  # --- Column Labels ---
+  cols_label(
+    `Novel 5' & 3'` = md("**Novel 5' & 3'**"),
+    `Novel 5'` = md("**Novel 5'**"),
+    `Novel 3'` = md("**Novel 3'**"),
+    `Not Novel (Known)` = md("**Known**"),
+  ) %>%
+  # --- Styling ---
+  tab_options(
+    table.border.top.color = "black",
+    table.border.bottom.color = "black",
+    column_labels.border.bottom.color = "black",
+    column_labels.font.weight = "bold",
+    table_body.border.bottom.color = "black",
+    row_group.border.top.style = "none",
+    row_group.border.bottom.color = "black",
+    row_group.font.weight = "bold",
+    stub.font.weight = "normal",
+    heading.title.font.size = "large",
+    heading.subtitle.font.size = "medium",
+    source_notes.font.size = "small",
+    data_row.padding = px(7) # Added a bit more padding for readability
+  ) %>%
+  # Widen the first column for the descriptive text
+  cols_width(
+    Criterion ~ px(500)
+  ) %>%
+  # Center the main content columns
+  cols_align(
+    align = "center",
+    columns = c(`Novel 5' & 3'`, `Novel 5'`, `Novel 3'`, `Not Novel (Known)`)
+  ) %>%
+  # Align the first column (the stub) to the left
+  cols_align(
+    align = "left",
+    columns = Criterion
+  ) 
+
+# 3. Display the final table
+isoform_filter_table_english
+
+# 4. Save the table to a file
+gtsave(isoform_filter_table_english, "isoform_filtering_table.html")
+
+```
+
