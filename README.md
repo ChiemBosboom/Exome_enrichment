@@ -24,7 +24,7 @@ capture bias against longer genes. Our findings validate exome enrichment as a
 highly effective strategy to enhance isoform discovery in challenging tissues but
 underscore the need to consider its inherent biases when designing future studies.
 
-## Analysis Pipeline & Repository Contents
+## Repository Contents
 
 The analysis is organized into several R Markdown (`.Rmd`) scripts that perform distinct steps of the workflow.
 
